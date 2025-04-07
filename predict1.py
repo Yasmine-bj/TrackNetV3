@@ -1,4 +1,4 @@
-import os
+import os 
 import argparse
 import numpy as np
 from tqdm import tqdm
@@ -13,19 +13,6 @@ import cv2
 from test import predict_location, get_ensemble_weight, generate_inpaint_mask
 from dataset import Shuttlecock_Trajectory_Dataset, Video_IterableDataset
 from utils.general import *
-
-
-# Profiling function for DataLoader
-def profile_dataloader(data_loader):
-    start_time = time.time()
-    for step, batch in enumerate(tqdm(data_loader)):
-        # Print the structure of the batch to understand its contents
-        print(f"Batch {step} structure: {type(batch)}, Length: {len(batch)}")
-        # You can modify this to handle more than two returned items if necessary
-        pass  # Keep this for profiling purposes
-    end_time = time.time()
-    print(f"Time taken for data loading: {end_time - start_time:.2f} seconds")
-
 
 """def predict_location_hybrid(heatmap, use_contour_threshold=0.2):
     
@@ -195,8 +182,6 @@ def main():
             data_loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False,
                                      num_workers=num_workers, drop_last=False,
                                      pin_memory=True, prefetch_factor=4, persistent_workers=True)
-            # Profile the DataLoader here
-            profile_dataloader(data_loader)
         for step, (i, x) in enumerate(tqdm(data_loader)):
             x = x.float().cuda()
             with torch.inference_mode():
@@ -226,8 +211,6 @@ def main():
             data_loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False,
                                      num_workers=num_workers, drop_last=False,
                                      pin_memory=True, prefetch_factor=4, persistent_workers=True)
-            # Profile the DataLoader here
-            profile_dataloader(data_loader)
             video_len = len(frame_list)
         y_pred_buffer = torch.zeros((seq_len - 1, seq_len, HEIGHT, WIDTH),
                                     dtype=torch.float32, device='cuda')
@@ -282,8 +265,6 @@ def main():
             data_loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False,
                                      num_workers=num_workers, drop_last=False,
                                      pin_memory=True, prefetch_factor=4 , persistent_workers=True)
-            # Profile the DataLoader here
-            profile_dataloader(data_loader)
             for step, (i, coor_pred, inpaint_mask) in enumerate(tqdm(data_loader)):
                 coor_pred, inpaint_mask = coor_pred.float().cuda(), inpaint_mask.float().cuda()
                 with torch.inference_mode():
@@ -298,8 +279,6 @@ def main():
             data_loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False,
                                      num_workers=num_workers, drop_last=False,
                                      pin_memory=True, prefetch_factor=4, persistent_workers=True)
-            # Profile the DataLoader here
-            profile_dataloader(data_loader)
             weight = get_ensemble_weight(seq_len, args.eval_mode).cuda()
             num_sample = len(dataset)
             sample_count = 0
@@ -364,4 +343,4 @@ if __name__ == '__main__':
     p.sort_stats('cumtime').print_stats(30)
     end_time = time.time()
     total_time = end_time - start_time
-    print(f"Temps total d'exécution: {total_time:.2f} secondes")  
+    print(f"Temps total d'exécution: {total_time:.2f} secondes")

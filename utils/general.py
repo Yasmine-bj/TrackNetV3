@@ -200,29 +200,31 @@ def get_rally_dirs(data_dir, split):
     return rally_dirs
 
 def generate_frames(video_file):
-    """ Sample frames from the video.
+    """Sample frames from the video.
 
-        Args:
-            video_file (str): File path of the video file
+    Args:
+        video_file (str): File path of the video file
 
-        Returns:
-            frame_list (List[numpy.ndarray]): List of sampled frames
+    Returns:
+        List[numpy.ndarray]: List of sampled frames
     """
-
     assert video_file[-4:] == '.mp4', 'Invalid video file format.'
 
-    # Get camera parameters
     cap = cv2.VideoCapture(video_file)
-    frame_list = []
-    success = True
-
-    # Sample frames until video end
-    while success:
+    frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    # Pré-allocation d'une liste de la taille approximative du nombre de frames
+    frame_list = [None] * frame_count
+    idx = 0
+    while True:
         success, frame = cap.read()
-        if success:
-            frame_list.append(frame)
-            
-    return frame_list
+        if not success:
+            break
+        frame_list[idx] = frame
+        idx += 1
+    cap.release()
+    # Retourner uniquement les frames lues
+    return frame_list[:idx]
+
 
 def draw_traj(img, traj, radius=3, color='red'):
     """ Draw trajectory on the image.

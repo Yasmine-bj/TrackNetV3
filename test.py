@@ -23,31 +23,30 @@ inpaintnet_eval_types = ['inpaint', 'reconstruct', 'baseline']
 
 
 def get_ensemble_weight(seq_len, eval_mode):
-    """ Get weight for temporal ensemble.
+    """Get weight for temporal ensemble.
 
-        Args:
-            seq_len (int): Length of input sequence
-            eval_mode (str): Mode of temporal ensemble
-                Choices:
-                    - 'average': Return uniform weight
-                    - 'weight': Return positional weight
-        
-        Returns:
-            weight (torch.Tensor): Weight for temporal ensemble
+    Args:
+        seq_len (int): Length of input sequence
+        eval_mode (str): Mode of temporal ensemble
+            Choices:
+                - 'average': Return uniform weight
+                - 'weight': Return positional weight
+
+    Returns:
+        torch.Tensor: Weight for temporal ensemble
     """
-
     if eval_mode == 'average':
-        weight = torch.ones(seq_len) / seq_len
+        return torch.full((seq_len,), 1.0 / seq_len, dtype=torch.float32)
     elif eval_mode == 'weight':
-        weight = torch.ones(seq_len)
-        for i in range(math.ceil(seq_len/2)):
-            weight[i] = (i+1)
-            weight[seq_len-i-1] = (i+1)
+        # Créer un vecteur [0, 1, 2, ..., seq_len-1]
+        indices = torch.arange(seq_len, dtype=torch.float32)
+        # Calculer les poids symétriques en utilisant torch.min avec le vecteur inversé
+        weight = torch.min(indices + 1, torch.flip(indices, dims=[0]) + 1)
         weight = weight / weight.sum()
+        return weight
     else:
         raise ValueError('Invalid mode')
-    
-    return weight
+
 
 def predict_location(heatmap):
     """ Get coordinates from the heatmap.

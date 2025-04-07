@@ -8,6 +8,13 @@ from PIL import Image
 from tqdm import tqdm
 from torch.utils.data import Dataset, IterableDataset
 from utils.general import get_rally_dirs, get_match_median, HEIGHT, WIDTH, SIGMA, IMG_FORMAT
+from line_profiler import LineProfiler
+   
+import numpy as np
+import time
+from PIL import Image
+import torch
+
 
 data_dir = 'data'
 
@@ -93,6 +100,12 @@ class Shuttlecock_Trajectory_Dataset(Dataset):
         self.pred_dict = pred_dict
         self.padding = padding and self.sliding_step == self.seq_len
 
+
+
+        # Prétraitement par batch des images (déplacement ici dans la méthode)
+        if self.frame_arr is not None:
+            self.frame_arr_resized = np.array([np.array(Image.fromarray(frame).resize((WIDTH, HEIGHT))) for frame in self.frame_arr])
+        
         # Initialize the input data
         if self.frame_arr is not None:
             # For TrackNet inference
@@ -412,186 +425,215 @@ class Shuttlecock_Trajectory_Dataset(Dataset):
     def __len__(self):
         """ Return the number of data in the dataset. """
         return len(self.data_dict['id'])
-
+    
+    
     def __getitem__(self, idx):
-        """ Return the data of the given index.
+        
+        """Return the data of the given index.
+        
+        Pour training/évaluation:
+        'heatmap': Return data_idx, frames, heatmaps, tmp_coor, tmp_vis
+        'coordinate': Return data_idx, coor_pred, inpaint
 
-            For training and evaluation:
-                'heatmap': Return data_idx, frames, heatmaps, tmp_coor, tmp_vis
-                'coordinate': Return data_idx, coor_pred, inpaint
-
-            For inference:
-                'heatmap': Return data_idx, frames
-                'coordinate': Return data_idx, coor_pred, inpaint
-        """
+        Pour inference:
+        'heatmap': Return data_idx, frames
+        'coordinate': Return data_idx, coor_pred, inpaint"""
+        
+        start_time = time.time()  # Démarrer le chronomètre
+        # --- Cas 1 : Les frames sont préchargées (inférence ou training sur frame_arr) ---
         if self.frame_arr is not None:
-            data_idx = self.data_dict['id'][idx] # (L,)
-            imgs = self.frame_arr[data_idx[:, 1], ...] # (L, H, W, 3)
-
+            data_idx = self.data_dict['id'][idx]  # (L,)
+            imgs = self.frame_arr[data_idx[:, 1], ...]  # (L, H, W, 3)
             if self.bg_mode:
                 median_img = self.median
-            
-            # Process the frame sequence
-            frames = np.array([]).reshape(0, self.HEIGHT, self.WIDTH)
+
+            # Accumuler les frames dans une liste pour éviter des concaténations répétées
+            frames_list = []
             for i in range(self.seq_len):
                 img = Image.fromarray(imgs[i])
                 if self.bg_mode == 'subtract':
-                    img = Image.fromarray(np.sum(np.absolute(img - median_img), 2).astype('uint8'))
-                    img = np.array(img.resize(size=(self.WIDTH, self.HEIGHT)))
-                    img = img.reshape(1, self.HEIGHT, self.WIDTH)
+                    proc_img = Image.fromarray(
+                        np.sum(np.absolute(np.array(img) - median_img), axis=2).astype('uint8')
+                    )
+                    proc_img = np.array(proc_img.resize((self.WIDTH, self.HEIGHT))).reshape(1, self.HEIGHT, self.WIDTH)
                 elif self.bg_mode == 'subtract_concat':
-                    diff_img = Image.fromarray(np.sum(np.absolute(img - median_img), 2).astype('uint8'))
-                    diff_img = np.array(diff_img.resize(size=(self.WIDTH, self.HEIGHT)))
-                    diff_img = diff_img.reshape(1, self.HEIGHT, self.WIDTH)
-                    img = np.array(img.resize(size=(self.WIDTH, self.HEIGHT)))
-                    img = np.moveaxis(img, -1, 0)
-                    img = np.concatenate((img, diff_img), axis=0)
+                    diff_img = Image.fromarray(
+                        np.sum(np.absolute(np.array(img) - median_img), axis=2).astype('uint8')
+                    )
+                    diff_img = np.array(diff_img.resize((self.WIDTH, self.HEIGHT))).reshape(1, self.HEIGHT, self.WIDTH)
+                    img_resized = np.array(img.resize((self.WIDTH, self.HEIGHT)))
+                    img_resized = np.moveaxis(img_resized, -1, 0)
+                    proc_img = np.concatenate((img_resized, diff_img), axis=0)
                 else:
-                    img = np.array(img.resize(size=(self.WIDTH, self.HEIGHT)))
-                    img = np.moveaxis(img, -1, 0)
-                
-                frames = np.concatenate((frames, img), axis=0)
-            
+                    proc_img = np.array(img.resize((self.WIDTH, self.HEIGHT)))
+                    proc_img = np.moveaxis(proc_img, -1, 0)
+                frames_list.append(proc_img)
+            # Concaténer toutes les frames une seule fois
+            frames = np.concatenate(frames_list, axis=0)
             if self.bg_mode == 'concat':
                 frames = np.concatenate((median_img, frames), axis=0)
-            
-            # Normalization
-            frames /= 255.
-
+            frames = frames / 255.
             return data_idx, frames
 
+        # --- Cas 2 : Utilisation des prédictions déjà effectuées ---
         elif self.pred_dict is not None:
-            data_idx = self.data_dict['id'][idx] # (L,)
-            coor_pred = self.data_dict['coor_pred'][idx] # (L, 2)
-            inpaint = self.data_dict['inpaint_mask'][idx].reshape(-1, 1) # (L, 1)
+            data_idx = self.data_dict['id'][idx]  # (L,)
+            coor_pred = self.data_dict['coor_pred'][idx]  # (L, 2)
+            inpaint = self.data_dict['inpaint_mask'][idx].reshape(-1, 1)  # (L, 1)
             w, h = self.img_config['img_shape']
-            
-            # Normalization
-            coor_pred[:, 0] = coor_pred[:, 0] / w
-            coor_pred[:, 1] = coor_pred[:, 1] / h
-
+            # Normalisation
+            coor_pred[:, 0] /= w
+            coor_pred[:, 1] /= h
             return data_idx, coor_pred, inpaint
 
+        # --- Cas 3 : Mode "heatmap" ---
         elif self.data_mode == 'heatmap':
+            # 3.1 : Avec frame_alpha > 0 (mixup)
             if self.frame_alpha > 0:
-                data_idx = self.data_dict['id'][idx] # (L,)
-                frame_file = self.data_dict['frame_file'][idx] # (L,)
-                coor = self.data_dict['coor'][idx] # (L, 2)
-                vis = self.data_dict['vis'][idx] # (L,)
+                data_idx = self.data_dict['id'][idx]  # (L,)
+                frame_file = self.data_dict['frame_file'][idx]  # (L,)
+                coor = self.data_dict['coor'][idx]  # (L, 2)
+                vis = self.data_dict['vis'][idx]  # (L,)
                 w, h = self.img_config['img_shape'][data_idx[0][0]]
                 w_scaler, h_scaler = self.img_config['img_scaler'][data_idx[0][0]]
-
+                
                 if self.bg_mode:
-                    file_format_str = os.path.join('{}', 'frame', '{}','{}.'+IMG_FORMAT)
-                    match_dir, rally_id, _ = parse.parse(file_format_str, frame_file[0])#'{}/frame/{}/{}.png', frame_file[0])
-                    median_file = os.path.join(match_dir, 'median.npz') if os.path.exists(os.path.join(match_dir, 'median.npz')) else os.path.join(match_dir, 'frame', rally_id, 'median.npz')
+                    file_format_str = os.path.join('{}', 'frame', '{}', '{}.' + IMG_FORMAT)
+                    match_dir, rally_id, _ = parse.parse(file_format_str, frame_file[0])
+                    median_file = (os.path.join(match_dir, 'median.npz')
+                                if os.path.exists(os.path.join(match_dir, 'median.npz'))
+                                else os.path.join(match_dir, 'frame', rally_id, 'median.npz'))
                     assert os.path.exists(median_file), f'{median_file} does not exist.'
                     median_img = np.load(median_file)['median']
                 
-                # Frame mixup
-                # Sample the mixing ratio
+                # Mixup : échantillonnage du ratio
                 lamb = np.random.beta(self.frame_alpha, self.frame_alpha)
-
-                # Initialize the previous frame data
+                
+                # Traitement de la première frame
                 prev_img = Image.open(frame_file[0])
                 if self.bg_mode == 'subtract':
-                    prev_img = Image.fromarray(np.sum(np.absolute(prev_img - median_img), 2).astype('uint8'))
-                    prev_img = np.array(prev_img.resize(size=(self.WIDTH, self.HEIGHT)))
-                    prev_img = prev_img.reshape(1, self.HEIGHT, self.WIDTH)
+                    prev_img = Image.fromarray(
+                        np.sum(np.absolute(np.array(prev_img) - median_img), axis=2).astype('uint8')
+                    )
+                    prev_img_np = np.array(prev_img.resize((self.WIDTH, self.HEIGHT))).reshape(1, self.HEIGHT, self.WIDTH)
                 elif self.bg_mode == 'subtract_concat':
-                    diff_img = Image.fromarray(np.sum(np.absolute(prev_img - median_img), 2).astype('uint8'))
-                    diff_img = np.array(diff_img.resize(size=(self.WIDTH, self.HEIGHT)))
-                    diff_img = diff_img.reshape(1, self.HEIGHT, self.WIDTH)
-                    prev_img = np.array(prev_img.resize(size=(self.WIDTH, self.HEIGHT)))
-                    prev_img = np.moveaxis(prev_img, -1, 0)
-                    prev_img = np.concatenate((prev_img, diff_img), axis=0)
+                    diff_img = Image.fromarray(
+                        np.sum(np.absolute(np.array(prev_img) - median_img), axis=2).astype('uint8')
+                    )
+                    diff_img_np = np.array(diff_img.resize((self.WIDTH, self.HEIGHT))).reshape(1, self.HEIGHT, self.WIDTH)
+                    prev_img_np = np.array(prev_img.resize((self.WIDTH, self.HEIGHT)))
+                    prev_img_np = np.moveaxis(prev_img_np, -1, 0)
+                    prev_img_np = np.concatenate((prev_img_np, diff_img_np), axis=0)
                 else:
-                    prev_img = np.array(prev_img.resize(size=(self.WIDTH, self.HEIGHT)))
-                    prev_img = np.moveaxis(prev_img, -1, 0)
-
+                    prev_img_np = np.array(prev_img.resize((self.WIDTH, self.HEIGHT)))
+                    prev_img_np = np.moveaxis(prev_img_np, -1, 0)
+                
                 prev_coor = coor[0]
                 prev_vis = vis[0]
-                prev_heatmap = self._get_heatmap(int(coor[0][0]/ w_scaler), int(coor[0][1]/ h_scaler))
+                prev_heatmap = self._get_heatmap(int(coor[0][0] / w_scaler), int(coor[0][1] / h_scaler))
                 
-                # Keep first dimension as timestamp for resample
+                # Initialisation des listes d'accumulation
+                frames_list = []
+                tmp_coor_list = []
+                tmp_vis_list = []
+                heatmaps_list = []
+                # Stocker la première frame et ses infos
                 if self.bg_mode == 'subtract':
-                    frames = prev_img.reshape(1, 1, self.HEIGHT, self.WIDTH)
+                    frames_list.append(prev_img_np.reshape(1, 1, self.HEIGHT, self.WIDTH))
                 elif self.bg_mode == 'subtract_concat':
-                    frames = prev_img.reshape(1, 4, self.HEIGHT, self.WIDTH)
+                    frames_list.append(prev_img_np.reshape(1, 4, self.HEIGHT, self.WIDTH))
                 else:
-                    frames = prev_img.reshape(1, 3, self.HEIGHT, self.WIDTH)
-
-                tmp_coor = prev_coor.reshape(1, -1)
-                tmp_vis = prev_vis.reshape(1, -1)
-                heatmaps = prev_heatmap
+                    frames_list.append(prev_img_np.reshape(1, 3, self.HEIGHT, self.WIDTH))
+                tmp_coor_list.append(prev_coor.reshape(1, -1))
+                tmp_vis_list.append(np.array([prev_vis]).reshape(1, -1))
+                heatmaps_list.append(prev_heatmap)
                 
-                # Read image and generate heatmap
+                # Boucle sur les frames restantes
                 for i in range(1, self.seq_len):
                     cur_img = Image.open(frame_file[i])
                     if self.bg_mode == 'subtract':
-                        cur_img = Image.fromarray(np.sum(np.absolute(cur_img - median_img), 2).astype('uint8'))
-                        cur_img = np.array(cur_img.resize(size=(self.WIDTH, self.HEIGHT)))
-                        cur_img = cur_img.reshape(1, self.HEIGHT, self.WIDTH)
+                        cur_img = Image.fromarray(
+                            np.sum(np.absolute(np.array(cur_img) - median_img), axis=2).astype('uint8')
+                        )
+                        cur_img_np = np.array(cur_img.resize((self.WIDTH, self.HEIGHT))).reshape(1, self.HEIGHT, self.WIDTH)
                     elif self.bg_mode == 'subtract_concat':
-                        diff_img = Image.fromarray(np.sum(np.absolute(cur_img - median_img), 2).astype('uint8'))
-                        diff_img = np.array(diff_img.resize(size=(self.WIDTH, self.HEIGHT)))
-                        diff_img = diff_img.reshape(1, self.HEIGHT, self.WIDTH)
-                        cur_img = np.array(cur_img.resize(size=(self.WIDTH, self.HEIGHT)))
-                        cur_img = np.moveaxis(cur_img, -1, 0)
-                        cur_img = np.concatenate((cur_img, diff_img), axis=0)
+                        diff_img = Image.fromarray(
+                            np.sum(np.absolute(np.array(cur_img) - median_img), axis=2).astype('uint8')
+                        )
+                        diff_img_np = np.array(diff_img.resize((self.WIDTH, self.HEIGHT))).reshape(1, self.HEIGHT, self.WIDTH)
+                        cur_img_np = np.array(cur_img.resize((self.WIDTH, self.HEIGHT)))
+                        cur_img_np = np.moveaxis(cur_img_np, -1, 0)
+                        cur_img_np = np.concatenate((cur_img_np, diff_img_np), axis=0)
                     else:
-                        cur_img = np.array(cur_img.resize(size=(self.WIDTH, self.HEIGHT)))
-                        cur_img = np.moveaxis(cur_img, -1, 0)
-
-                    inter_img = prev_img * lamb + cur_img * (1 - lamb)
-
-                    # Linear interpolation
+                        cur_img_np = np.array(cur_img.resize((self.WIDTH, self.HEIGHT)))
+                        cur_img_np = np.moveaxis(cur_img_np, -1, 0)
+                    
+                    # Mixup linéaire
+                    inter_img = prev_img_np * lamb + cur_img_np * (1 - lamb)
+                    
+                    # Détermination des coordonnées et heatmaps
                     if vis[i] == 0:
                         inter_coor = prev_coor
                         inter_vis = prev_vis
                         cur_heatmap = prev_heatmap
                         inter_heatmap = cur_heatmap
-                    elif prev_vis == 0 or math.sqrt(pow(prev_coor[0]-coor[i][0], 2)+pow(prev_coor[1]-coor[i][1], 2)) < 10:
+                    elif prev_vis == 0 or math.sqrt((prev_coor[0] - coor[i][0])**2 + (prev_coor[1] - coor[i][1])**2) < 10:
                         inter_coor = coor[i]
                         inter_vis = vis[i]
-                        cur_heatmap = self._get_heatmap(int(inter_coor[0]/ w_scaler), int(inter_coor[1]/ h_scaler))
+                        cur_heatmap = self._get_heatmap(int(inter_coor[0] / w_scaler), int(inter_coor[1] / h_scaler))
                         inter_heatmap = cur_heatmap
                     else:
                         inter_coor = coor[i]
                         inter_vis = vis[i]
-                        cur_heatmap = self._get_heatmap(int(coor[i][0]/ w_scaler), int(coor[i][1]/ h_scaler))
+                        cur_heatmap = self._get_heatmap(int(coor[i][0] / w_scaler), int(coor[i][1] / h_scaler))
                         inter_heatmap = prev_heatmap * lamb + cur_heatmap * (1 - lamb)
                     
-                    tmp_coor = np.concatenate((tmp_coor, inter_coor.reshape(1, -1), coor[i].reshape(1, -1)), axis=0)
-                    tmp_vis = np.concatenate((tmp_vis, np.array([inter_vis]).reshape(1, -1), np.array([vis[i]]).reshape(1, -1)), axis=0)
-                    frames = np.concatenate((frames, inter_img[None,:,:,:], cur_img[None,:,:,:]), axis=0)
-                    heatmaps = np.concatenate((heatmaps, inter_heatmap, cur_heatmap), axis=0)
+                    # Accumuler les résultats dans les listes
+                    tmp_coor_list.append(inter_coor.reshape(1, -1))
+                    tmp_coor_list.append(coor[i].reshape(1, -1))
+                    tmp_vis_list.append(np.array([inter_vis]).reshape(1, -1))
+                    tmp_vis_list.append(np.array([vis[i]]).reshape(1, -1))
+                    frames_list.append(inter_img[None, :, :, :])
+                    frames_list.append(cur_img_np[None, :, :, :])
+                    heatmaps_list.append(inter_heatmap)
+                    heatmaps_list.append(cur_heatmap)
                     
-                    prev_img, prev_heatmap, prev_coor, prev_vis = cur_img, cur_heatmap, coor[i], vis[i]
+                    # Mise à jour des variables pour l'itération suivante
+                    prev_img_np, prev_heatmap, prev_coor, prev_vis = cur_img_np, cur_heatmap, coor[i], vis[i]
                 
-                # Resample input sequence
-                rand_id = np.random.choice(len(frames), self.seq_len, replace=False)
-                rand_id = np.sort(rand_id)
-                tmp_coor = tmp_coor[rand_id]
-                tmp_vis = tmp_vis[rand_id]
-                frames = frames[rand_id]
-                heatmaps = heatmaps[rand_id]
+                # Concaténer les tableaux accumulés
+                frames_all = np.concatenate(frames_list, axis=0)
+                tmp_coor_all = np.concatenate(tmp_coor_list, axis=0)
+                tmp_vis_all = np.concatenate(tmp_vis_list, axis=0)
+                heatmaps_all = np.concatenate(heatmaps_list, axis=0)
+                # Resélection aléatoire de self.seq_len éléments
+                rand_id = np.sort(np.random.choice(len(frames_all), self.seq_len, replace=False))
+                frames_sel = frames_all[rand_id]
+                tmp_coor_sel = tmp_coor_all[rand_id]
+                tmp_vis_sel = tmp_vis_all[rand_id]
+                heatmaps_sel = heatmaps_all[rand_id]
                 
                 if self.bg_mode == 'concat':
-                    median_img = Image.fromarray(median_img.astype('uint8'))
-                    median_img = np.array(median_img.resize(size=(self.WIDTH, self.HEIGHT)))
-                    median_img = np.moveaxis(median_img, -1, 0)
-                    frames = np.concatenate((median_img.reshape(1, 3, self.HEIGHT, self.WIDTH), frames), axis=0)
+                    median_img_pil = Image.fromarray(median_img.astype('uint8')).resize((self.WIDTH, self.HEIGHT))
+                    median_np = np.array(median_img_pil)
+                    median_np = np.moveaxis(median_np, -1, 0)
+                    frames_sel = np.concatenate(
+                        (median_np.reshape(1, median_np.shape[0], self.HEIGHT, self.WIDTH),
+                        frames_sel.reshape(self.seq_len, frames_list[0].shape[0], self.HEIGHT, self.WIDTH)),
+                        axis=0
+                    )
+                    frames_sel = frames_sel.reshape(-1, self.HEIGHT, self.WIDTH)
+                else:
+                    frames_sel = frames_sel.reshape(-1, self.HEIGHT, self.WIDTH)
                 
-                # Reshape to model input format
-                frames = frames.reshape(-1, self.HEIGHT, self.WIDTH)
+                # Normalisation
+                frames_sel = frames_sel / 255.
+                tmp_coor_sel[:, 0] /= w
+                tmp_coor_sel[:, 1] /= h
+                
+                return data_idx, frames_sel, heatmaps_sel, tmp_coor_sel, tmp_vis_sel
 
-                # Normalization
-                frames /= 255.
-                tmp_coor[:, 0] = tmp_coor[:, 0] / w
-                tmp_coor[:, 1] = tmp_coor[:, 1] / h
-
-                return data_idx, frames, heatmaps, tmp_coor, tmp_vis
+            # 3.2 : Mode "heatmap" avec frame_alpha <= 0
             else:
                 data_idx = self.data_dict['id'][idx]
                 frame_file = self.data_dict['frame_file'][idx]
@@ -599,71 +641,79 @@ class Shuttlecock_Trajectory_Dataset(Dataset):
                 vis = self.data_dict['vis'][idx]
                 w, h = self.img_config['img_shape'][data_idx[0][0]]
                 w_scaler, h_scaler = self.img_config['img_scaler'][data_idx[0][0]]
-
-                # Read median image
+                
                 if self.bg_mode:
-                    file_format_str = os.path.join('{}', 'frame', '{}','{}.'+IMG_FORMAT)
-                    match_dir, rally_id, _ = parse.parse(file_format_str, frame_file[0])#'{}/frame/{}/{}.png', frame_file[0])
-                    median_file = os.path.join(match_dir, 'median.npz') if os.path.exists(os.path.join(match_dir, 'median.npz')) else os.path.join(match_dir, 'frame', rally_id, 'median.npz')
+                    file_format_str = os.path.join('{}', 'frame', '{}', '{}.' + IMG_FORMAT)
+                    match_dir, rally_id, _ = parse.parse(file_format_str, frame_file[0])
+                    median_file = (os.path.join(match_dir, 'median.npz')
+                                if os.path.exists(os.path.join(match_dir, 'median.npz'))
+                                else os.path.join(match_dir, 'frame', rally_id, 'median.npz'))
                     assert os.path.exists(median_file), f'{median_file} does not exist.'
                     median_img = np.load(median_file)['median']
-
-                frames = np.array([]).reshape(0, self.HEIGHT, self.WIDTH)
-                heatmaps = np.array([]).reshape(0, self.HEIGHT, self.WIDTH)
                 
-                # Read image and generate heatmap
+                frames_list = []
+                heatmaps_list = []
                 for i in range(self.seq_len):
                     img = Image.open(frame_file[i])
                     if self.bg_mode == 'subtract':
-                        img = Image.fromarray(np.sum(np.absolute(img - median_img), 2).astype('uint8'))
-                        img = np.array(img.resize(size=(self.WIDTH, self.HEIGHT)))
-                        img = img.reshape(1, self.HEIGHT, self.WIDTH)
+                        proc_img = Image.fromarray(
+                            np.sum(np.absolute(np.array(img) - median_img), axis=2).astype('uint8')
+                        )
+                        img_np = np.array(proc_img.resize((self.WIDTH, self.HEIGHT))).reshape(1, self.HEIGHT, self.WIDTH)
                     elif self.bg_mode == 'subtract_concat':
-                        diff_img = Image.fromarray(np.sum(np.absolute(img - median_img), 2).astype('uint8'))
-                        diff_img = np.array(diff_img.resize(size=(self.WIDTH, self.HEIGHT)))
-                        diff_img = diff_img.reshape(1, self.HEIGHT, self.WIDTH)
-                        img = np.array(img.resize(size=(self.WIDTH, self.HEIGHT)))
-                        img = np.moveaxis(img, -1, 0)
-                        img = np.concatenate((img, diff_img), axis=0)
+                        diff_img = Image.fromarray(
+                            np.sum(np.absolute(np.array(img) - median_img), axis=2).astype('uint8')
+                        )
+                        diff_np = np.array(diff_img.resize((self.WIDTH, self.HEIGHT))).reshape(1, self.HEIGHT, self.WIDTH)
+                        img_np = np.array(img.resize((self.WIDTH, self.HEIGHT)))
+                        img_np = np.moveaxis(img_np, -1, 0)
+                        img_np = np.concatenate((img_np, diff_np), axis=0)
                     else:
-                        img = np.array(img.resize(size=(self.WIDTH, self.HEIGHT)))
-                        img = np.moveaxis(img, -1, 0)
-                    
-                    heatmap = self._get_heatmap(int(coor[i][0]/w_scaler), int(coor[i][1]/h_scaler))
-                    frames = np.concatenate((frames, img), axis=0)
-                    heatmaps = np.concatenate((heatmaps, heatmap), axis=0)
+                        img_np = np.array(img.resize((self.WIDTH, self.HEIGHT)))
+                        img_np = np.moveaxis(img_np, -1, 0)
+                    heatmap = self._get_heatmap(int(coor[i][0] / w_scaler), int(coor[i][1] / h_scaler))
+                    frames_list.append(img_np)
+                    heatmaps_list.append(heatmap)
                 
+                frames_all = np.concatenate(frames_list, axis=0).reshape(-1, self.HEIGHT, self.WIDTH)
+                heatmaps_all = np.concatenate(heatmaps_list, axis=0).reshape(-1, self.HEIGHT, self.WIDTH)
                 if self.bg_mode == 'concat':
-                    median_img = Image.fromarray(median_img.astype('uint8'))
-                    median_img = np.array(median_img.resize(size=(self.WIDTH, self.HEIGHT)))
-                    median_img = np.moveaxis(median_img, -1, 0)
-                    frames = np.concatenate((median_img, frames), axis=0)
+                    median_img_pil = Image.fromarray(median_img.astype('uint8')).resize((self.WIDTH, self.HEIGHT))
+                    median_np = np.array(median_img_pil)
+                    median_np = np.moveaxis(median_np, -1, 0)
+                    frames_all = np.concatenate((median_np, frames_all), axis=0)
+                frames_all = frames_all / 255.
+                coor[:, 0] /= w
+                coor[:, 1] /= h
+                
+                return data_idx, frames_all, heatmaps_all, coor, vis
 
-                # Normalization
-                frames /= 255.
-                coor[:, 0] = coor[:, 0] / w
-                coor[:, 1] = coor[:, 1] / h
-
-                return data_idx, frames, heatmaps, coor, vis
-        
+        # --- Cas 4 : Mode "coordinate" ---
         elif self.data_mode == 'coordinate':
-            data_idx = self.data_dict['id'][idx] # (L,)
-            coor = self.data_dict['coor'][idx] # (L, 2)
-            coor_pred = self.data_dict['coor_pred'][idx] # (L, 2)
-            vis = self.data_dict['vis'][idx] # (L,)
-            vis_pred = self.data_dict['pred_vis'][idx] # (L,)
-            inpaint = self.data_dict['inpaint_mask'][idx] # (L,)
+            data_idx = self.data_dict['id'][idx]  # (L,)
+            coor = self.data_dict['coor'][idx]      # (L, 2)
+            coor_pred = self.data_dict['coor_pred'][idx]  # (L, 2)
+            vis = self.data_dict['vis'][idx]         # (L,)
+            vis_pred = self.data_dict['pred_vis'][idx]  # (L,)
+            inpaint = self.data_dict['inpaint_mask'][idx]  # (L,)
             w, h = self.img_config['img_shape'][data_idx[0][0]]
-            
-            # Normalization
-            coor[:, 0] = coor[:, 0] / self.WIDTH
-            coor[:, 1] = coor[:, 1] / self.HEIGHT
-            coor_pred[:, 0] = coor_pred[:, 0] / self.WIDTH
-            coor_pred[:, 1] = coor_pred[:, 1] / self.HEIGHT
-
+            # Normalisation
+            coor[:, 0] /= self.WIDTH
+            coor[:, 1] /= self.HEIGHT
+            coor_pred[:, 0] /= self.WIDTH
+            coor_pred[:, 1] /= self.HEIGHT
             return data_idx, coor_pred, coor, vis_pred.reshape(-1, 1), vis.reshape(-1, 1), inpaint.reshape(-1, 1)
+            
         else:
             raise NotImplementedError
+
+
+    
+
+
+
+
+
 
 
 class Video_IterableDataset(IterableDataset):

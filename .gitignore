@@ -16,3 +16,4 @@ model_compare.py
 predict_old.py
 *.sh
 *.mp4
+/home/jovyan/TrackNetV3/TrackNetV3_ckpts.zipTrackNetV3_ckpts.zip

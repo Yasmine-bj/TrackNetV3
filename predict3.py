@@ -75,7 +75,7 @@ def predict(indices, y_pred=None, c_pred=None, img_scaler=(1, 1)):
                 f_i = indices[n][f][1]
                 if f_i != prev_f_i:
                     y_p = y_pred[n][f]
-                    bbox_pred = predict_location_fast(to_img(y_p))  # Fast location prediction via heatmap
+                    bbox_pred = predict_location(to_img(y_p))  # Fast location prediction via heatmap
 
                     # Calculate x, y coordinates of the bounding box center
                     cx_pred = int((bbox_pred[0] + bbox_pred[2] / 2) * img_scaler[0])

@@ -251,75 +251,90 @@ def draw_traj(img, traj, radius=3, color='red'):
 
     return img
 
+import os
+import cv2
+from collections import deque
+import imageio
+import numpy as np
+
 def write_pred_video(video_file, pred_dict, save_file, traj_len=8, label_df=None):
-    """ Write a video with prediction result.
-
-        Args:
-            video_file (str): File path of the input video file
-            pred_dict (Dict): Prediction result
-                Format: {'Frame': frame_id (List[int]),
-                         'X': x_pred (List[int]),
-                         'Y': y_pred (List[int]),
-                         'Visibility': vis_pred (List[int])}
-            save_file (str): File path of the output video file
-            traj_len (int, optional): Length of trajectory to draw
-            label_df (pandas.DataFrame, optional): Ground truth label dataframe
-        
-        Returns:
-            None
     """
-    # Read video
+    Write a video with prediction result, using imageio-ffmpeg for H.264 output.
+    """
+    # Read input video to get fps & frame size
     cap = cv2.VideoCapture(video_file)
-    fps = int(cap.get(cv2.CAP_PROP_FPS))
-    w, h = (int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)))
-    fourcc = int(cap.get(cv2.CAP_PROP_FOURCC))
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    w   = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    h   = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
-    # Read ground truth label if exists
-    if label_df is not None:
-        f_i, x, y, vis = label_df['Frame'], label_df['X'], label_df['Y'], label_df['Visibility']
-    
-    # Read prediction result
-    x_pred, y_pred, vis_pred = pred_dict['X'], pred_dict['Y'], pred_dict['Visibility']
+    # Prepare output directory
+    os.makedirs(os.path.dirname(save_file), exist_ok=True)
 
-    # Video config
-    out = cv2.VideoWriter(save_file, fourcc, fps, (w, h))
-    
-    # Create a queue for storing trajectory
-    pred_queue = deque()
+    # Open imageio writer with libx264 codec
+    writer = imageio.get_writer(
+        save_file,
+        fps = fps,
+        codec = 'libx264',
+        ffmpeg_params = ['-pix_fmt', 'yuv420p']  # assure la compatibilité
+    )
+
+    # Load prediction arrays
+    frames_pred = pred_dict['Frame']
+    x_pred      = pred_dict['X']
+    y_pred      = pred_dict['Y']
+    vis_pred    = pred_dict['Visibility']
+
+    # If ground-truth provided
     if label_df is not None:
-        gt_queue = deque()
-    
-    # Draw label and prediction trajectory
-    #for i, frame in enumerate(frame_list):
-    i = 0
+        frames_gt = label_df['Frame'].tolist()
+        x_gt      = label_df['X'].tolist()
+        y_gt      = label_df['Y'].tolist()
+        vis_gt    = label_df['Visibility'].tolist()
+
+    # Queues for trajectories
+    pred_queue = deque(maxlen=traj_len)
+    if label_df is not None:
+        gt_queue = deque(maxlen=traj_len)
+
+    frame_index = 0
     while True:
-        success, frame = cap.read()
-        if not success:
+        ret, frame = cap.read()
+        if not ret:
             break
-        
-        # Check capacity of queue
-        if len(pred_queue) >= traj_len:
-            pred_queue.pop()
-        if label_df is not None and len(gt_queue) >= traj_len:
-            gt_queue.pop()
-        
-        # Push ball coordinates for each frame
+
+        # Append new point or None
+        if frame_index < len(vis_pred) and vis_pred[frame_index]:
+            pred_queue.append((x_pred[frame_index], y_pred[frame_index]))
+        else:
+            pred_queue.append(None)
+
         if label_df is not None:
-            gt_queue.appendleft([x[i], y[i]]) if vis[i] and i < len(label_df) else gt_queue.appendleft(None)
-        pred_queue.appendleft([x_pred[i], y_pred[i]]) if vis_pred[i] else pred_queue.appendleft(None)
+            if frame_index < len(vis_gt) and vis_gt[frame_index]:
+                gt_queue.append((x_gt[frame_index], y_gt[frame_index]))
+            else:
+                gt_queue.append(None)
 
-        # Draw ground truth trajectory if exists
+        # Draw trajectories
+        # ground truth in red
         if label_df is not None:
-            frame = draw_traj(frame, gt_queue, color='red')
-        
-        # Draw prediction trajectory
-        frame = draw_traj(frame, pred_queue, color='yellow')
+            for pt in gt_queue:
+                if pt is not None:
+                    cv2.circle(frame, pt, 3, (0,0,255), -1)
 
-        out.write(frame)
-        i+=1
+        # predictions in yellow
+        for pt in pred_queue:
+            if pt is not None:
+                cv2.circle(frame, pt, 3, (0,255,255), -1)
 
-    out.release()
+        # Convert BGR→RGB for imageio
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        writer.append_data(rgb)
+
+        frame_index += 1
+
+    writer.close()
     cap.release()
+    print(f"Vidéo annotée sauvegardée dans : {save_file}")
 
 def write_pred_csv(pred_dict, save_file, save_inpaint_mask=False):
     """ Write prediction result to csv file.

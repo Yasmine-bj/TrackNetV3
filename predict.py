@@ -27,20 +27,6 @@ def profile_dataloader(data_loader):
     print(f"Time taken for data loading: {end_time - start_time:.2f} seconds")
 
 
-"""def predict_location_hybrid(heatmap, use_contour_threshold=0.2):
-    
-    If the heatmap has a clear strong peak, use fast argmax.
-    Otherwise fallback to cv2.findContours (original method).
-    
-    max_val = np.max(heatmap)
-    if max_val == 0:
-        return 0, 0, 0, 0
-    if max_val >= use_contour_threshold * 255:  # scale is assumed to be 0–255
-        y, x = np.unravel_index(np.argmax(heatmap), heatmap.shape)
-        return x, y, 1, 1
-    else:
-        return predict_location(heatmap)  """
-
 def predict_location_fast(heatmap):
     """Fastest location estimation using the max intensity point."""
     if np.amax(heatmap) == 0:

@@ -6,17 +6,15 @@ import numpy as np
 import pandas as pd
 from PIL import Image
 from tqdm import tqdm
-from torch.utils.data import Dataset, IterableDataset
+from torch.utils.data import Dataset, IterableDataset, get_worker_info
 from utils.general import get_rally_dirs, get_match_median, HEIGHT, WIDTH, SIGMA, IMG_FORMAT
-from line_profiler import LineProfiler
-   
+from line_profiler import LineProfiler 
 import numpy as np
 import time
 from PIL import Image
 import torch
-
-
 data_dir = 'data'
+
 
 class Shuttlecock_Trajectory_Dataset(Dataset):
     """ Shuttlecock_Trajectory_Dataset
@@ -75,8 +73,6 @@ class Shuttlecock_Trajectory_Dataset(Dataset):
                 median (numpy.ndarray): Median image
         """
 
-        assert split in ['train', 'test', 'val'], f'Invalid split: {split}, should be train, test or val'
-        assert data_mode in ['heatmap', 'coordinate'], f'Invalid data_mode: {data_mode}, should be heatmap or coordinate'
         assert bg_mode in ['', 'subtract', 'subtract_concat', 'concat'], f'Invalid bg_mode: {bg_mode}, should be "", subtract, subtract_concat or concat'
 
         # Image size
@@ -124,38 +120,7 @@ class Shuttlecock_Trajectory_Dataset(Dataset):
             # For InpaintNet inference
             assert self.data_mode == 'coordinate', f'Invalid data_mode: {self.data_mode}, pred_dict only for coordinate mode'
             self.data_dict, self.img_config = self._gen_input_from_pred_dict()
-        else:
-            # Generate rally image configuration file
-            self.rally_dict = self._get_rally_dict()
-            img_config_file = os.path.join(self.root_dir, f'img_config_{self.HEIGHT}x{self.WIDTH}_{self.split}.npz')
-            if not os.path.exists(img_config_file):
-                self._gen_rally_img_congif_file(img_config_file)
-            img_config = np.load(img_config_file)
-            self.img_config = {key: img_config[key] for key in img_config.keys()}
-            
-            # For training and evaluation
-            if rally_dir is not None:
-                # Rally based
-                self.data_dict = self._gen_input_from_rally_dir(rally_dir)
-            else:
-                # Split based
-                # Generate and load input file 
-                input_file = os.path.join(self.root_dir, f'data_l{self.seq_len}_s{self.sliding_step}_{self.data_mode}_{self.split}.npz')
-                if not os.path.exists(input_file):
-                    self._gen_input_file(file_name=input_file)
-                data_dict = np.load(input_file)
-                self.data_dict = {key: data_dict[key] for key in data_dict.keys()}
-            if debug:
-                num_data = 256
-                for key in self.data_dict.keys():
-                    self.data_dict[key] = self.data_dict[key][:num_data]
 
-    def _get_rally_dict(self):
-        """ Return the rally index-path mapping dictionary. """
-        rally_dirs = get_rally_dirs(self.root_dir, self.split)
-        rally_dict = {'i2p':{i: os.path.join(self.root_dir, rally_dir) for i, rally_dir in enumerate(rally_dirs)},
-                      'p2i':{os.path.join(self.root_dir, rally_dir): i for i, rally_dir in enumerate(rally_dirs)}}
-        return rally_dict
 
     def _get_rally_i(self, rally_dir):
         """ Return the corresponding rally index of the rally directory. """
@@ -170,174 +135,9 @@ class Shuttlecock_Trajectory_Dataset(Dataset):
         split, _ = parse.parse(file_format_str, rally_dir)
         return split
     
-    def _gen_rally_img_congif_file(self, file_name):
-        """ Generate rally image configuration file. """
-        img_scaler = [] # (num_rally, 2)
-        img_shape = [] # (num_rally, 2)
-
-        for rally_i, rally_dir in tqdm(self.rally_dict['i2p'].items()):
-            w, h = Image.open(os.path.join(rally_dir, f'0.{IMG_FORMAT}')).size
-            w_scaler, h_scaler = w / self.WIDTH, h / self.HEIGHT
-            img_scaler.append((w_scaler, h_scaler))
-            img_shape.append((w, h))
-        
-        np.savez(file_name, img_scaler=img_scaler, img_shape=img_shape)
+    
             
-    def _gen_input_file(self, file_name):
-        """ Generate input file for training and evaluation. """
-        print('Generate input file...')
-        
-        if self.data_mode == 'heatmap':
-            id = np.array([], dtype=np.int32).reshape(0, self.seq_len, 2)
-            frame_file = np.array([]).reshape(0, self.seq_len)
-            coor = np.array([], dtype=np.float32).reshape(0, self.seq_len, 2)
-            vis = np.array([], dtype=np.float32).reshape(0, self.seq_len)
-
-            # Generate input sequences from each rally
-            for rally_i, rally_dir in tqdm(self.rally_dict['i2p'].items()):
-                data_dict = self._gen_input_from_rally_dir(rally_dir)
-                id = np.concatenate((id, data_dict['id']), axis=0)
-                frame_file = np.concatenate((frame_file, data_dict['frame_file']), axis=0)
-                coor = np.concatenate((coor, data_dict['coor']), axis=0)
-                vis = np.concatenate((vis, data_dict['vis']), axis=0)
-            
-            np.savez(file_name, id=id, frame_file=frame_file, coor=coor, vis=vis)
-        else:
-            id = np.array([], dtype=np.int32).reshape(0, self.seq_len, 2)
-            coor = np.array([], dtype=np.float32).reshape(0, self.seq_len, 2)
-            coor_pred = np.array([], dtype=np.float32).reshape(0, self.seq_len, 2)
-            vis = np.array([], dtype=np.float32).reshape(0, self.seq_len)
-            pred_vis = np.array([], dtype=np.float32).reshape(0, self.seq_len)
-            inpaint_mask = np.array([], dtype=np.float32).reshape(0, self.seq_len)
-
-            # Generate input sequences from each rally
-            for rally_i, rally_dir in tqdm(self.rally_dict['i2p'].items()):
-                data_dict = self._gen_input_from_rally_dir(rally_dir)
-                id = np.concatenate((id, data_dict['id']), axis=0)
-                coor = np.concatenate((coor, data_dict['coor']), axis=0)
-                coor_pred = np.concatenate((coor_pred, data_dict['coor_pred']), axis=0)
-                vis = np.concatenate((vis, data_dict['vis']), axis=0)
-                pred_vis = np.concatenate((pred_vis, data_dict['pred_vis']), axis=0)
-                inpaint_mask = np.concatenate((inpaint_mask, data_dict['inpaint_mask']), axis=0)
-            
-            np.savez(file_name, id=id, coor=coor, coor_pred=coor_pred,
-                     vis=vis, pred_vis=pred_vis, inpaint_mask=inpaint_mask)
-
-    def _gen_input_from_rally_dir(self, rally_dir):
-        """ Generate input sequences from a rally directory. """
-
-        rally_i = self._get_rally_i(rally_dir)
-        
-        file_format_str = os.path.join('{}', 'frame', '{}')
-        match_dir, rally_id = parse.parse(file_format_str, rally_dir)
-        
-        if self.data_mode == 'heatmap':
-            # Read label csv file
-            if 'test' in rally_dir:
-                csv_file = os.path.join(match_dir, 'corrected_csv', f'{rally_id}_ball.csv')
-            else:
-                csv_file = os.path.join(match_dir, 'csv', f'{rally_id}_ball.csv')
-            
-            assert os.path.exists(csv_file), f'{csv_file} does not exist.'
-            label_df = pd.read_csv(csv_file, encoding='utf8').sort_values(by='Frame').fillna(0)
-
-            f_file = np.array([os.path.join(rally_dir, f'{f_id}.{IMG_FORMAT}') for f_id in label_df['Frame']])
-            x, y, v = np.array(label_df['X']), np.array(label_df['Y']), np.array(label_df['Visibility'])
-
-            id = np.array([], dtype=np.int32).reshape(0, self.seq_len, 2)
-            frame_file = np.array([]).reshape(0, self.seq_len)
-            coor = np.array([], dtype=np.float32).reshape(0, self.seq_len, 2)
-            vis = np.array([], dtype=np.float32).reshape(0, self.seq_len)
-            
-            # Sliding on the frame sequence
-            last_idx = -1
-            for i in range(0, len(f_file), self.sliding_step):
-                tmp_idx, tmp_frames, tmp_coor, tmp_vis = [], [], [], []
-                # Construct a single input sequence
-                for f in range(self.seq_len):
-                    if i+f < len(f_file):
-                        tmp_idx.append((rally_i, i+f))
-                        tmp_frames.append(f_file[i+f])
-                        tmp_coor.append((x[i+f], y[i+f]))
-                        tmp_vis.append(v[i+f])
-                        last_idx = i+f
-                    else:
-                        # Padding the last sequence if imcompleted
-                        if self.padding:
-                            tmp_idx.append((rally_i, last_idx))
-                            tmp_frames.append(f_file[last_idx])
-                            tmp_coor.append((x[last_idx], y[last_idx]))
-                            tmp_vis.append(v[last_idx])
-                        else:
-                            break
-                
-                # Append the input sequence
-                if len(tmp_frames) == self.seq_len:
-                    assert len(tmp_frames) == len(tmp_coor) == len(tmp_vis),\
-                    f'Length of frames, coordinates and visibilities are not equal.'
-                    id = np.concatenate((id, [tmp_idx]), axis=0)
-                    frame_file = np.concatenate((frame_file, [tmp_frames]), axis=0)
-                    coor = np.concatenate((coor, [tmp_coor]), axis=0)
-                    vis = np.concatenate((vis, [tmp_vis]), axis=0)
-            
-            return dict(id=id, frame_file=frame_file, coor=coor, vis=vis)
-        else:
-            # Read predicted csv file
-            pred_csv_file = os.path.join(match_dir, 'predicted_csv', f'{rally_id}_ball.csv')
-            assert os.path.exists(pred_csv_file), f'{pred_csv_file} does not exist.'
-            pred_df = pd.read_csv(pred_csv_file, encoding='utf8').sort_values(by='Frame').fillna(0)
-
-            f_file = np.array([os.path.join(rally_dir, f'{f_id}.{IMG_FORMAT}') for f_id in pred_df['Frame']])
-            x, y, v = np.array(pred_df['X_GT']), np.array(pred_df['Y_GT']), np.array(pred_df['Visibility_GT'])
-            x_pred, y_pred, v_pred = np.array(pred_df['X']), np.array(pred_df['Y']), np.array(pred_df['Visibility'])
-            inpaint = np.array(pred_df['Inpaint_Mask'])
-
-            id = np.array([], dtype=np.int32).reshape(0, self.seq_len, 2)
-            coor = np.array([], dtype=np.float32).reshape(0, self.seq_len, 2)
-            coor_pred = np.array([], dtype=np.float32).reshape(0, self.seq_len, 2)
-            vis = np.array([], dtype=np.float32).reshape(0, self.seq_len)
-            pred_vis = np.array([], dtype=np.float32).reshape(0, self.seq_len)
-            inpaint_mask = np.array([], dtype=np.float32).reshape(0, self.seq_len)
-
-            # Sliding on the frame sequence
-            last_idx = -1
-            for i in range(0, len(f_file), self.sliding_step):
-                tmp_idx, tmp_coor, tmp_coor_pred, tmp_vis, tmp_vis_pred, tmp_inpaint  = [], [], [], [], [], []
-                # Construct a single input sequence
-                for f in range(self.seq_len):
-                    if i+f < len(f_file):
-                        tmp_idx.append((rally_i, i+f))
-                        tmp_coor.append((x[i+f], y[i+f]))
-                        tmp_coor_pred.append((x_pred[i+f], y_pred[i+f]))
-                        tmp_vis.append(v[i+f])
-                        tmp_vis_pred.append(v_pred[i+f])
-                        tmp_inpaint.append(inpaint[i+f])
-                    else:
-                        # Padding the last sequence if imcompleted
-                        if self.padding:
-                            tmp_idx.append((rally_i, last_idx))
-                            tmp_coor.append((x[last_idx], y[last_idx]))
-                            tmp_coor_pred.append((x_pred[last_idx], y_pred[last_idx]))
-                            tmp_vis.append(v[last_idx])
-                            tmp_vis_pred.append(v_pred[last_idx])
-                            tmp_inpaint.append(inpaint[last_idx])
-                        else:
-                            break
-
-                # Append the input sequence
-                if len(tmp_idx) == self.seq_len:
-                    assert len(tmp_idx) == len(tmp_coor) == len(tmp_coor_pred) == \
-                           len(tmp_vis) == len(tmp_vis_pred) == len(tmp_inpaint), \
-                            f'Length of frames, coordinates, predicted coordinates,\
-                            visibilities, predicted visibilities and inpaint masks are not equal.'
-                    id = np.concatenate((id, [tmp_idx]), axis=0)
-                    coor = np.concatenate((coor, [tmp_coor]), axis=0)
-                    coor_pred = np.concatenate((coor_pred, [tmp_coor_pred]), axis=0)
-                    vis = np.concatenate((vis, [tmp_vis]), axis=0)
-                    pred_vis = np.concatenate((pred_vis, [tmp_vis_pred]), axis=0)
-                    inpaint_mask = np.concatenate((inpaint_mask, [tmp_inpaint]), axis=0)
-            
-            return dict(id=id, coor=coor, coor_pred=coor_pred, vis=vis, pred_vis=pred_vis, inpaint_mask=inpaint_mask)
+ 
 
     def _gen_input_from_frame_arr(self):
         """ Generate input sequences from a frame array. """
@@ -411,17 +211,7 @@ class Shuttlecock_Trajectory_Dataset(Dataset):
         return dict(id=id, coor_pred=coor_pred, pred_vis=pred_vis, inpaint_mask=inpaint_mask),\
                dict(img_scaler=self.pred_dict['Img_scaler'], img_shape=self.pred_dict['Img_shape']) 
     
-    def _get_heatmap(self, cx, cy):
-        """ Generate a Gaussian heatmap centered at (cx, cy). """
-        if cx == cy == 0:
-            return np.zeros((1, self.HEIGHT, self.WIDTH))
-        x, y = np.meshgrid(np.linspace(1, self.WIDTH, self.WIDTH), np.linspace(1, self.HEIGHT, self.HEIGHT))
-        heatmap = ((y - (cy + 1))**2) + ((x - (cx + 1))**2)
-        heatmap[heatmap <= self.sigma**2] = 1.
-        heatmap[heatmap > self.sigma**2] = 0.
-        heatmap = heatmap * self.mag
-        return heatmap.reshape(1, self.HEIGHT, self.WIDTH)
-
+   
     def __len__(self):
         """ Return the number of data in the dataset. """
         return len(self.data_dict['id'])
@@ -439,7 +229,7 @@ class Shuttlecock_Trajectory_Dataset(Dataset):
         'heatmap': Return data_idx, frames
         'coordinate': Return data_idx, coor_pred, inpaint"""
         
-        start_time = time.time()  # Démarrer le chronomètre
+        
         # --- Cas 1 : Les frames sont préchargées (inférence ou training sur frame_arr) ---
         if self.frame_arr is not None:
             data_idx = self.data_dict['id'][idx]  # (L,)
@@ -485,380 +275,122 @@ class Shuttlecock_Trajectory_Dataset(Dataset):
             coor_pred[:, 0] /= w
             coor_pred[:, 1] /= h
             return data_idx, coor_pred, inpaint
-
-        # --- Cas 3 : Mode "heatmap" ---
-        elif self.data_mode == 'heatmap':
-            # 3.1 : Avec frame_alpha > 0 (mixup)
-            if self.frame_alpha > 0:
-                data_idx = self.data_dict['id'][idx]  # (L,)
-                frame_file = self.data_dict['frame_file'][idx]  # (L,)
-                coor = self.data_dict['coor'][idx]  # (L, 2)
-                vis = self.data_dict['vis'][idx]  # (L,)
-                w, h = self.img_config['img_shape'][data_idx[0][0]]
-                w_scaler, h_scaler = self.img_config['img_scaler'][data_idx[0][0]]
-                
-                if self.bg_mode:
-                    file_format_str = os.path.join('{}', 'frame', '{}', '{}.' + IMG_FORMAT)
-                    match_dir, rally_id, _ = parse.parse(file_format_str, frame_file[0])
-                    median_file = (os.path.join(match_dir, 'median.npz')
-                                if os.path.exists(os.path.join(match_dir, 'median.npz'))
-                                else os.path.join(match_dir, 'frame', rally_id, 'median.npz'))
-                    assert os.path.exists(median_file), f'{median_file} does not exist.'
-                    median_img = np.load(median_file)['median']
-                
-                # Mixup : échantillonnage du ratio
-                lamb = np.random.beta(self.frame_alpha, self.frame_alpha)
-                
-                # Traitement de la première frame
-                prev_img = Image.open(frame_file[0])
-                if self.bg_mode == 'subtract':
-                    prev_img = Image.fromarray(
-                        np.sum(np.absolute(np.array(prev_img) - median_img), axis=2).astype('uint8')
-                    )
-                    prev_img_np = np.array(prev_img.resize((self.WIDTH, self.HEIGHT))).reshape(1, self.HEIGHT, self.WIDTH)
-                elif self.bg_mode == 'subtract_concat':
-                    diff_img = Image.fromarray(
-                        np.sum(np.absolute(np.array(prev_img) - median_img), axis=2).astype('uint8')
-                    )
-                    diff_img_np = np.array(diff_img.resize((self.WIDTH, self.HEIGHT))).reshape(1, self.HEIGHT, self.WIDTH)
-                    prev_img_np = np.array(prev_img.resize((self.WIDTH, self.HEIGHT)))
-                    prev_img_np = np.moveaxis(prev_img_np, -1, 0)
-                    prev_img_np = np.concatenate((prev_img_np, diff_img_np), axis=0)
-                else:
-                    prev_img_np = np.array(prev_img.resize((self.WIDTH, self.HEIGHT)))
-                    prev_img_np = np.moveaxis(prev_img_np, -1, 0)
-                
-                prev_coor = coor[0]
-                prev_vis = vis[0]
-                prev_heatmap = self._get_heatmap(int(coor[0][0] / w_scaler), int(coor[0][1] / h_scaler))
-                
-                # Initialisation des listes d'accumulation
-                frames_list = []
-                tmp_coor_list = []
-                tmp_vis_list = []
-                heatmaps_list = []
-                # Stocker la première frame et ses infos
-                if self.bg_mode == 'subtract':
-                    frames_list.append(prev_img_np.reshape(1, 1, self.HEIGHT, self.WIDTH))
-                elif self.bg_mode == 'subtract_concat':
-                    frames_list.append(prev_img_np.reshape(1, 4, self.HEIGHT, self.WIDTH))
-                else:
-                    frames_list.append(prev_img_np.reshape(1, 3, self.HEIGHT, self.WIDTH))
-                tmp_coor_list.append(prev_coor.reshape(1, -1))
-                tmp_vis_list.append(np.array([prev_vis]).reshape(1, -1))
-                heatmaps_list.append(prev_heatmap)
-                
-                # Boucle sur les frames restantes
-                for i in range(1, self.seq_len):
-                    cur_img = Image.open(frame_file[i])
-                    if self.bg_mode == 'subtract':
-                        cur_img = Image.fromarray(
-                            np.sum(np.absolute(np.array(cur_img) - median_img), axis=2).astype('uint8')
-                        )
-                        cur_img_np = np.array(cur_img.resize((self.WIDTH, self.HEIGHT))).reshape(1, self.HEIGHT, self.WIDTH)
-                    elif self.bg_mode == 'subtract_concat':
-                        diff_img = Image.fromarray(
-                            np.sum(np.absolute(np.array(cur_img) - median_img), axis=2).astype('uint8')
-                        )
-                        diff_img_np = np.array(diff_img.resize((self.WIDTH, self.HEIGHT))).reshape(1, self.HEIGHT, self.WIDTH)
-                        cur_img_np = np.array(cur_img.resize((self.WIDTH, self.HEIGHT)))
-                        cur_img_np = np.moveaxis(cur_img_np, -1, 0)
-                        cur_img_np = np.concatenate((cur_img_np, diff_img_np), axis=0)
-                    else:
-                        cur_img_np = np.array(cur_img.resize((self.WIDTH, self.HEIGHT)))
-                        cur_img_np = np.moveaxis(cur_img_np, -1, 0)
-                    
-                    # Mixup linéaire
-                    inter_img = prev_img_np * lamb + cur_img_np * (1 - lamb)
-                    
-                    # Détermination des coordonnées et heatmaps
-                    if vis[i] == 0:
-                        inter_coor = prev_coor
-                        inter_vis = prev_vis
-                        cur_heatmap = prev_heatmap
-                        inter_heatmap = cur_heatmap
-                    elif prev_vis == 0 or math.sqrt((prev_coor[0] - coor[i][0])**2 + (prev_coor[1] - coor[i][1])**2) < 10:
-                        inter_coor = coor[i]
-                        inter_vis = vis[i]
-                        cur_heatmap = self._get_heatmap(int(inter_coor[0] / w_scaler), int(inter_coor[1] / h_scaler))
-                        inter_heatmap = cur_heatmap
-                    else:
-                        inter_coor = coor[i]
-                        inter_vis = vis[i]
-                        cur_heatmap = self._get_heatmap(int(coor[i][0] / w_scaler), int(coor[i][1] / h_scaler))
-                        inter_heatmap = prev_heatmap * lamb + cur_heatmap * (1 - lamb)
-                    
-                    # Accumuler les résultats dans les listes
-                    tmp_coor_list.append(inter_coor.reshape(1, -1))
-                    tmp_coor_list.append(coor[i].reshape(1, -1))
-                    tmp_vis_list.append(np.array([inter_vis]).reshape(1, -1))
-                    tmp_vis_list.append(np.array([vis[i]]).reshape(1, -1))
-                    frames_list.append(inter_img[None, :, :, :])
-                    frames_list.append(cur_img_np[None, :, :, :])
-                    heatmaps_list.append(inter_heatmap)
-                    heatmaps_list.append(cur_heatmap)
-                    
-                    # Mise à jour des variables pour l'itération suivante
-                    prev_img_np, prev_heatmap, prev_coor, prev_vis = cur_img_np, cur_heatmap, coor[i], vis[i]
-                
-                # Concaténer les tableaux accumulés
-                frames_all = np.concatenate(frames_list, axis=0)
-                tmp_coor_all = np.concatenate(tmp_coor_list, axis=0)
-                tmp_vis_all = np.concatenate(tmp_vis_list, axis=0)
-                heatmaps_all = np.concatenate(heatmaps_list, axis=0)
-                # Resélection aléatoire de self.seq_len éléments
-                rand_id = np.sort(np.random.choice(len(frames_all), self.seq_len, replace=False))
-                frames_sel = frames_all[rand_id]
-                tmp_coor_sel = tmp_coor_all[rand_id]
-                tmp_vis_sel = tmp_vis_all[rand_id]
-                heatmaps_sel = heatmaps_all[rand_id]
-                
-                if self.bg_mode == 'concat':
-                    median_img_pil = Image.fromarray(median_img.astype('uint8')).resize((self.WIDTH, self.HEIGHT))
-                    median_np = np.array(median_img_pil)
-                    median_np = np.moveaxis(median_np, -1, 0)
-                    frames_sel = np.concatenate(
-                        (median_np.reshape(1, median_np.shape[0], self.HEIGHT, self.WIDTH),
-                        frames_sel.reshape(self.seq_len, frames_list[0].shape[0], self.HEIGHT, self.WIDTH)),
-                        axis=0
-                    )
-                    frames_sel = frames_sel.reshape(-1, self.HEIGHT, self.WIDTH)
-                else:
-                    frames_sel = frames_sel.reshape(-1, self.HEIGHT, self.WIDTH)
-                
-                # Normalisation
-                frames_sel = frames_sel / 255.
-                tmp_coor_sel[:, 0] /= w
-                tmp_coor_sel[:, 1] /= h
-                
-                return data_idx, frames_sel, heatmaps_sel, tmp_coor_sel, tmp_vis_sel
-
-            # 3.2 : Mode "heatmap" avec frame_alpha <= 0
-            else:
-                data_idx = self.data_dict['id'][idx]
-                frame_file = self.data_dict['frame_file'][idx]
-                coor = self.data_dict['coor'][idx]
-                vis = self.data_dict['vis'][idx]
-                w, h = self.img_config['img_shape'][data_idx[0][0]]
-                w_scaler, h_scaler = self.img_config['img_scaler'][data_idx[0][0]]
-                
-                if self.bg_mode:
-                    file_format_str = os.path.join('{}', 'frame', '{}', '{}.' + IMG_FORMAT)
-                    match_dir, rally_id, _ = parse.parse(file_format_str, frame_file[0])
-                    median_file = (os.path.join(match_dir, 'median.npz')
-                                if os.path.exists(os.path.join(match_dir, 'median.npz'))
-                                else os.path.join(match_dir, 'frame', rally_id, 'median.npz'))
-                    assert os.path.exists(median_file), f'{median_file} does not exist.'
-                    median_img = np.load(median_file)['median']
-                
-                frames_list = []
-                heatmaps_list = []
-                for i in range(self.seq_len):
-                    img = Image.open(frame_file[i])
-                    if self.bg_mode == 'subtract':
-                        proc_img = Image.fromarray(
-                            np.sum(np.absolute(np.array(img) - median_img), axis=2).astype('uint8')
-                        )
-                        img_np = np.array(proc_img.resize((self.WIDTH, self.HEIGHT))).reshape(1, self.HEIGHT, self.WIDTH)
-                    elif self.bg_mode == 'subtract_concat':
-                        diff_img = Image.fromarray(
-                            np.sum(np.absolute(np.array(img) - median_img), axis=2).astype('uint8')
-                        )
-                        diff_np = np.array(diff_img.resize((self.WIDTH, self.HEIGHT))).reshape(1, self.HEIGHT, self.WIDTH)
-                        img_np = np.array(img.resize((self.WIDTH, self.HEIGHT)))
-                        img_np = np.moveaxis(img_np, -1, 0)
-                        img_np = np.concatenate((img_np, diff_np), axis=0)
-                    else:
-                        img_np = np.array(img.resize((self.WIDTH, self.HEIGHT)))
-                        img_np = np.moveaxis(img_np, -1, 0)
-                    heatmap = self._get_heatmap(int(coor[i][0] / w_scaler), int(coor[i][1] / h_scaler))
-                    frames_list.append(img_np)
-                    heatmaps_list.append(heatmap)
-                
-                frames_all = np.concatenate(frames_list, axis=0).reshape(-1, self.HEIGHT, self.WIDTH)
-                heatmaps_all = np.concatenate(heatmaps_list, axis=0).reshape(-1, self.HEIGHT, self.WIDTH)
-                if self.bg_mode == 'concat':
-                    median_img_pil = Image.fromarray(median_img.astype('uint8')).resize((self.WIDTH, self.HEIGHT))
-                    median_np = np.array(median_img_pil)
-                    median_np = np.moveaxis(median_np, -1, 0)
-                    frames_all = np.concatenate((median_np, frames_all), axis=0)
-                frames_all = frames_all / 255.
-                coor[:, 0] /= w
-                coor[:, 1] /= h
-                
-                return data_idx, frames_all, heatmaps_all, coor, vis
-
-        # --- Cas 4 : Mode "coordinate" ---
-        elif self.data_mode == 'coordinate':
-            data_idx = self.data_dict['id'][idx]  # (L,)
-            coor = self.data_dict['coor'][idx]      # (L, 2)
-            coor_pred = self.data_dict['coor_pred'][idx]  # (L, 2)
-            vis = self.data_dict['vis'][idx]         # (L,)
-            vis_pred = self.data_dict['pred_vis'][idx]  # (L,)
-            inpaint = self.data_dict['inpaint_mask'][idx]  # (L,)
-            w, h = self.img_config['img_shape'][data_idx[0][0]]
-            # Normalisation
-            coor[:, 0] /= self.WIDTH
-            coor[:, 1] /= self.HEIGHT
-            coor_pred[:, 0] /= self.WIDTH
-            coor_pred[:, 1] /= self.HEIGHT
-            return data_idx, coor_pred, coor, vis_pred.reshape(-1, 1), vis.reshape(-1, 1), inpaint.reshape(-1, 1)
-            
         else:
             raise NotImplementedError
 
 
-    
 
 
 
-
-
-
-
-class Video_IterableDataset(IterableDataset):
-    """ Dataset for inference especially for large video. """
+class VideoWindowDataset(Dataset):
     def __init__(self,
-        video_file,
-        seq_len=8,
-        sliding_step=1,
-        bg_mode='',
-        HEIGHT=HEIGHT,
-        WIDTH=WIDTH,
-        max_sample_num=1800,
-        video_range=None,
-        median=None
-    ):
-        """ Initialize the dataset
-            Args:
-                video_file (str}: File path of the video.
-                seq_len (int): Length of the input sequence.
-                sliding_step (int): Sliding step of the sliding window.
-                bg_mode (str): Background mode
-                    Choices:
-                        - '': Return original frame sequence
-                        - 'subtract': Return the difference frame sequence
-                        - 'subtract_concat': Return the frame sequence with RGB and difference frame channels
-                        - 'concat': Return the frame sequence with background as the first frame
-                HEIGHT (int): Height of the image for input.
-                WIDTH (int): Width of the image for input.
-                max_sample_num (int): Maximum number of frames to sample for generating median image.
-                video_range (Tuple[int]): Range of start second and end second of the video for generating median image.
-                median (np.ndarray): Median image.
-        """
-        # Image size
-        self.HEIGHT = HEIGHT
-        self.WIDTH = WIDTH
-
-        self.video_file = video_file
-        self.cap = cv2.VideoCapture(self.video_file)
-        self.video_len = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        self.fps = int(self.cap.get(cv2.CAP_PROP_FPS))
-        self.w, self.h = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        self.w_scaler, self.h_scaler = self.w / self.WIDTH, self.h / self.HEIGHT
-
-
-        self.seq_len = seq_len
+                 video_file: str,
+                 seq_len: int = 8,
+                 sliding_step: int = 1,
+                 bg_mode: str = '',
+                 HEIGHT: int = HEIGHT,
+                 WIDTH: int = WIDTH,
+                 max_sample_num: int = 1000,
+                 video_range: tuple = None,
+                 median: np.ndarray = None):
+        self.video_file   = video_file
+        self.seq_len      = seq_len
         self.sliding_step = sliding_step
-        self.bg_mode = bg_mode
-        if self.bg_mode:
-            self.median = median if median is not None else self.__gen_median__(max_sample_num, video_range)
+        self.bg_mode      = bg_mode
+        self.HEIGHT       = HEIGHT
+        self.WIDTH        = WIDTH
 
-    def __iter__(self):
-        """ Return the data squentially. """
-        self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-        success = True
-        start_f_id, end_f_id = 0, 0
-        frame_list = []
-        while success:
-            # Sample frames
-            while len(frame_list) < self.seq_len:
-                success, frame = self.cap.read()
-                if not success:
-                    break
-                frame_list.append(frame)
-                end_f_id += 1
+        # Ouvre la vidéo pour récupérer longueur et fps
+        cap = cv2.VideoCapture(video_file)
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        fps          = int(cap.get(cv2.CAP_PROP_FPS))
+        cap.release()
 
-            # Form a sequence
-            data_idx = [(0, i) for i in range(start_f_id, end_f_id)]
-            if len(data_idx) < self.seq_len:
-                # Padding the last sequence if imcompleted
-                data_idx.extend([(0, end_f_id-1)]*(self.seq_len - len(data_idx)))
-                frame_list.extend([frame_list[-1]]*(self.seq_len - len(frame_list)))
-            data_idx = np.array(data_idx)
-            frames = self.__process__(np.array(frame_list)[..., ::-1])
-            yield data_idx, frames
+        # Liste de tous les indices de début de séquences
+        self.starts = list(range(0, total_frames, sliding_step))
+        self.video_len = total_frames
+        self.fps       = fps
 
-            # Update the sliding window
-            frame_list = frame_list[self.sliding_step:]
-            start_f_id = start_f_id + self.sliding_step
-
-        self.cap.release()
-
-    def __gen_median__(self, max_sample_num, video_range):
-        """ Generate the median image.
-
-            Args:
-                max_sample_num (int): Maximum number of frames to sample for generating median image.
-                video_range (Tuple[int]): Range of start second and end second of the video for generating median image.
-        """
-        print('Generate median image...')
-        if video_range is None:
-            start_frame, end_frame = 0, self.video_len
+        # Pré-génère la médiane si besoin
+        if bg_mode and median is None:
+            self.median = self._gen_median(max_sample_num, video_range)
         else:
-            start_frame = max(0, video_range[0] * self.fps)
-            end_frame = min(video_range[1] * self.fps, self.video_len)
-        video_seg_len = end_frame - start_frame
+            self.median = median
 
-        if video_seg_len > max_sample_num:
-            sample_step = video_seg_len // max_sample_num
+    def __len__(self):
+        return len(self.starts)
+
+    def __getitem__(self, idx):
+        start_f = self.starts[idx]
+        cap     = cv2.VideoCapture(self.video_file)
+        cap.set(cv2.CAP_PROP_POS_FRAMES, start_f)
+
+        frames = []
+        for i in range(self.seq_len):
+            ret, frame = cap.read()
+            if not ret:
+                # padding avec la dernière image si fin de vidéo
+                frames.append(frames[-1].copy())
+            else:
+                frames.append(frame)
+        cap.release()
+
+        # transformation RGB→(C,H,W), concat, bg_mode…
+        imgs = np.stack(frames)[..., ::-1]  # BGR→RGB
+        processed = self._process(imgs)
+
+        # On transmet aussi les indices de frame pour le post-traitement
+        data_idx = [(0, min(start_f + i, self.video_len-1)) for i in range(self.seq_len)]
+        data_idx = np.array(data_idx, dtype=np.int64)
+
+        return data_idx, processed
+
+    def _gen_median(self, max_sample_num, video_range):
+        print('Generate median image…')
+        cap = cv2.VideoCapture(self.video_file)
+        total = self.video_len
+        if video_range:
+            start = min(max(0, video_range[0] * self.fps), total)
+            end   = min(video_range[1] * self.fps, total)
         else:
-            sample_step = 1
-        
-        frame_list = []
-        for i in range(start_frame, end_frame, sample_step):
-            self.cap.set(cv2.CAP_PROP_POS_FRAMES, i)
-            success, frame = self.cap.read()
-            if not success:
+            start, end = 0, total
+        seg_len = end - start
+        step    = max(1, seg_len // max_sample_num)
+
+        cap.set(cv2.CAP_PROP_POS_FRAMES, start)
+        samples = []
+        for _ in range(start, end, step):
+            ret, f = cap.read()
+            if not ret:
                 break
-            frame_list.append(frame)
-        median = np.median(frame_list, 0)[..., ::-1] # BGR to RGB
+            samples.append(f)
+            for __ in range(step-1):
+                cap.grab()
+        cap.release()
+
+        median = np.median(np.stack(samples), axis=0)[..., ::-1]
         if self.bg_mode == 'concat':
-            median = Image.fromarray(median.astype('uint8'))
-            median = np.array(median.resize(size=(self.WIDTH, self.HEIGHT)))
-            median = np.moveaxis(median, -1, 0)
+            median = cv2.resize(median, (self.WIDTH, self.HEIGHT),
+                                interpolation=cv2.INTER_NEAREST)
+            median = median.transpose(2,0,1)
         print('Median image generated.')
         return median
-    
-    def __process__(self, imgs):
-        """ Process the frame sequence. """
-        if self.bg_mode:
-            median_img = self.median
-        frames = np.array([]).reshape(0, self.HEIGHT, self.WIDTH)
-        for i in range(self.seq_len):
-            img = Image.fromarray(imgs[i])
-            if self.bg_mode == 'subtract':
-                img = Image.fromarray(np.sum(np.absolute(img - median_img), 2).astype('uint8'))
-                img = np.array(img.resize(size=(self.WIDTH, self.HEIGHT)))
-                img = img.reshape(1, self.HEIGHT, self.WIDTH)
-            elif self.bg_mode == 'subtract_concat':
-                diff_img = Image.fromarray(np.sum(np.absolute(img - median_img), 2).astype('uint8'))
-                diff_img = np.array(diff_img.resize(size=(self.WIDTH, self.HEIGHT)))
-                diff_img = diff_img.reshape(1, self.HEIGHT, self.WIDTH)
-                img = np.array(img.resize(size=(self.WIDTH, self.HEIGHT)))
-                img = np.moveaxis(img, -1, 0)
-                img = np.concatenate((img, diff_img), axis=0)
-            else:
-                img = np.array(img.resize(size=(self.WIDTH, self.HEIGHT)))
-                img = np.moveaxis(img, -1, 0)
-            
-            frames = np.concatenate((frames, img), axis=0)
-        
-        if self.bg_mode == 'concat':
-            frames = np.concatenate((median_img, frames), axis=0)
-        
-        # Normalization
-        frames /= 255.
-        return frames
 
-        
+    def _process(self, imgs: np.ndarray):
+        ch_list = []
+        for i in range(self.seq_len):
+            resized = cv2.resize(imgs[i], (self.WIDTH, self.HEIGHT),
+                                 interpolation=cv2.INTER_LINEAR)
+            ch_list.append(resized.transpose(2,0,1))
+
+        stacked = np.concatenate(ch_list, axis=0)  # 24 canaux
+
+        if self.bg_mode == 'subtract':
+            diff = cv2.absdiff(stacked[:3], self.median)
+            gray = cv2.cvtColor(diff.transpose(1,2,0), cv2.COLOR_RGB2GRAY)[None]
+            stacked = np.concatenate((gray, stacked[3:]), axis=0)
+
+        elif self.bg_mode == 'concat':
+            stacked = np.concatenate((self.median, stacked), axis=0)
+
+        return (stacked.astype(np.float32) / 255.0)

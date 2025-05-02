@@ -4,12 +4,9 @@ import numpy as np
 from tqdm import tqdm
 import time
 import sys
-
-
 import torch
 from torch.utils.data import DataLoader
 import cv2
-
 from test import predict_location, get_ensemble_weight, generate_inpaint_mask
 from dataset import Shuttlecock_Trajectory_Dataset, Video_IterableDataset
 from utils.general import *
@@ -221,7 +218,7 @@ def main():
         x = x.half().cuda()
         # Désactive le calcul des gradients pour accélérer l'inférence
         with torch.inference_mode():
-            with torch.cuda.amp.autocast():
+            with torch.amp.autocast(device_type='cuda'):
                 y_pred = tracknet(x) 
            
 

@@ -14,7 +14,7 @@ from pycocotools.cocoeval import COCOeval
 
 from dataset import Shuttlecock_Trajectory_Dataset, data_dir
 from utils.general import *
-from utils.metric import *
+# from utils.metric import *
 
 
 pred_types = ['TP', 'TN', 'FP1', 'FP2', 'FN']

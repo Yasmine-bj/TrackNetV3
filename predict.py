@@ -6,8 +6,8 @@ from tqdm import tqdm
 import torch
 from torch.utils.data import DataLoader, get_worker_info
 
-from test import predict_location, get_ensemble_weight, generate_inpaint_mask
-from dataset import Shuttlecock_Trajectory_Dataset, CircularVideoDataset
+from test import predict_location, get_ensemble_weight,predict
+from dataset import CircularVideoDataset
 from utils.general import *
 import time
 from tqdm import tqdm
@@ -15,62 +15,6 @@ from tqdm import tqdm
 
 
 
-def predict(indices, y_pred=None, c_pred=None, img_scaler=(1, 1)):
-    """ Predict coordinates from heatmap or inpainted coordinates. 
-
-        Args:
-            indices (torch.Tensor): indices of input sequence with shape (N, L, 2)
-            y_pred (torch.Tensor, optional): predicted heatmap sequence with shape (N, L, H, W)
-            c_pred (torch.Tensor, optional): predicted inpainted coordinates sequence with shape (N, L, 2)
-            img_scaler (Tuple): image scaler (w_scaler, h_scaler)
-
-        Returns:
-            pred_dict (Dict): dictionary of predicted coordinates
-                Format: {'Frame':[], 'X':[], 'Y':[], 'Visibility':[]}
-    """
-
-    pred_dict = {'Frame':[], 'X':[], 'Y':[], 'Visibility':[]}
-
-    batch_size, seq_len = indices.shape[0], indices.shape[1]
-    indices = indices.detach().cpu().numpy()if torch.is_tensor(indices) else indices.numpy()
-    
-    # Transform input for heatmap prediction
-    if y_pred is not None:
-        y_pred = y_pred > 0.5
-        y_pred = y_pred.detach().cpu().numpy() if torch.is_tensor(y_pred) else y_pred
-        y_pred = to_img_format(y_pred) # (N, L, H, W)
-    
-    # Transform input for coordinate prediction
-    if c_pred is not None:
-        c_pred = c_pred.detach().cpu().numpy() if torch.is_tensor(c_pred) else c_pred
-
-    prev_f_i = -1
-    for n in range(batch_size):
-        for f in range(seq_len):
-            f_i = indices[n][f][1]
-            if f_i != prev_f_i:
-                if c_pred is not None:
-                    # Predict from coordinate
-                    c_p = c_pred[n][f]
-                    cx_pred, cy_pred = int(c_p[0] * WIDTH * img_scaler[0]), int(c_p[1] * HEIGHT* img_scaler[1]) 
-                elif y_pred is not None:
-                    # Predict from heatmap
-                    y_p = y_pred[n][f]
-                    bbox_pred = predict_location(to_img(y_p))
-                    cx_pred, cy_pred = int(bbox_pred[0]+bbox_pred[2]/2), int(bbox_pred[1]+bbox_pred[3]/2)
-                    cx_pred, cy_pred = int(cx_pred*img_scaler[0]), int(cy_pred*img_scaler[1])
-                else:
-                    raise ValueError('Invalid input')
-                vis_pred = 0 if cx_pred == 0 and cy_pred == 0 else 1
-                pred_dict['Frame'].append(int(f_i))
-                pred_dict['X'].append(cx_pred)
-                pred_dict['Y'].append(cy_pred)
-                pred_dict['Visibility'].append(vis_pred)
-                prev_f_i = f_i
-            else:
-                break
-    
-    return pred_dict    
 
 def main():
 
@@ -148,24 +92,7 @@ def main():
         )
         video_len = int(cv2.VideoCapture(video_file).get(cv2.CAP_PROP_FRAME_COUNT))
         print(f'Video length: {video_len}')
-    else:
-        # Échantillonnage de toutes les images de la vidéo
-        frame_list = generate_frames(args.video_file)
-        dataset = Shuttlecock_Trajectory_Dataset(
-            seq_len=seq_len,
-            sliding_step=1,
-            data_mode='heatmap',
-            bg_mode=bg_mode,
-            frame_arr=np.array(frame_list)[:, :, :, ::-1]
-        )
-        data_loader = DataLoader(
-            dataset,
-            batch_size=args.batch_size,
-            shuffle=False,
-            num_workers=num_workers,
-            drop_last=False
-        )
-        video_len = len(frame_list)
+    
 
     # Initialisation des paramètres du buffer de prédiction
     num_sample = video_len - seq_len + 1
@@ -216,107 +143,7 @@ def main():
 
         # Mise à jour du buffer : conserver uniquement les dernières prédictions
         y_pred_buffer = y_pred_buffer[-buffer_size:]
-
-
-
     
-   
-
-    #assert video_len == len(tracknet_pred_dict['Frame']), 'Prediction length mismatch'
-    # Test on TrackNetV3 (TrackNet + InpaintNet)
-    if inpaintnet is not None:
-        inpaintnet.eval()
-        seq_len = inpaintnet_seq_len
-        tracknet_pred_dict['Inpaint_Mask'] = generate_inpaint_mask(tracknet_pred_dict, th_h=h*0.05)
-        inpaint_pred_dict = {'Frame':[], 'X':[], 'Y':[], 'Visibility':[]}
-
-        # Création du dataset avec échantillonnage par recouvrement pour l'ensemble temporel
-        dataset = Shuttlecock_Trajectory_Dataset(
-            seq_len=seq_len,
-            sliding_step=1,
-            data_mode='coordinate',
-            pred_dict=tracknet_pred_dict
-        )
-        data_loader = DataLoader(
-            dataset,
-            batch_size=args.batch_size,
-            shuffle=False,
-            num_workers=num_workers,
-            drop_last=False
-        )
-        weight = get_ensemble_weight(seq_len, args.eval_mode)
-
-        # Initialisation des paramètres du buffer
-        num_sample = len(dataset)
-        sample_count = 0
-        buffer_size = seq_len - 1
-        batch_indices = torch.arange(seq_len)              # Ex : [0, 1, 2, ..., seq_len-1]
-        frame_indices = torch.arange(seq_len - 1, -1, -1)   # Ex : [seq_len-1, ..., 0]
-        coor_inpaint_buffer = torch.zeros((buffer_size, seq_len, 2), dtype=torch.float32)
-
-        # Boucle de traitement principal
-        for step, (indices, coor_pred, inpaint_mask) in enumerate(tqdm(data_loader)):
-            coor_pred = coor_pred.float()
-            inpaint_mask = inpaint_mask.float()
-            batch_size = indices.shape[0]
-
-            with torch.no_grad():
-                coor_inpaint = inpaintnet(coor_pred.cuda(), inpaint_mask.cuda()).detach().cpu()
-                # Fusion des coordonnées inpaintées et originales selon le masque
-                coor_inpaint = coor_inpaint * inpaint_mask + coor_pred * (1 - inpaint_mask)
-
-            # Application du seuillage
-            threshold_mask = ((coor_inpaint[:, :, 0] < COOR_TH) & (coor_inpaint[:, :, 1] < COOR_TH))
-            coor_inpaint[threshold_mask] = 0.
-
-            # Mise à jour du buffer
-            coor_inpaint_buffer = torch.cat((coor_inpaint_buffer, coor_inpaint), dim=0)
-            ensemble_indices = torch.empty((0, 1, 2), dtype=torch.float32)
-            ensemble_coor_inpaint = torch.empty((0, 1, 2), dtype=torch.float32)
-
-            for b in range(batch_size):
-                if sample_count < buffer_size:
-                    # Cas du buffer incomplet
-                    aggregated = coor_inpaint_buffer[batch_indices + b, frame_indices].sum(0)
-                    aggregated /= (sample_count + 1)
-                else:
-                    # Cas général avec pondération
-                    weighted = coor_inpaint_buffer[batch_indices + b, frame_indices] * weight[:, None]
-                    aggregated = weighted.sum(0)
-
-                # Ajout aux ensembles pour la prédiction finale
-                ensemble_indices = torch.cat((ensemble_indices, indices[b][0].view(1, 1, 2)), dim=0)
-                ensemble_coor_inpaint = torch.cat((ensemble_coor_inpaint, aggregated.view(1, 1, 2)), dim=0)
-                sample_count += 1
-
-                if sample_count == num_sample:
-                    # Derniers échantillons
-                    zero_padding = torch.zeros((buffer_size, seq_len, 2), dtype=torch.float32)
-                    coor_inpaint_buffer = torch.cat((coor_inpaint_buffer, zero_padding), dim=0)
-
-                    for f in range(1, seq_len):
-                        aggregated = coor_inpaint_buffer[batch_indices + b + f, frame_indices].sum(0)
-                        aggregated /= (seq_len - f)
-                        ensemble_indices = torch.cat((ensemble_indices, indices[-1][f].view(1, 1, 2)), dim=0)
-                        ensemble_coor_inpaint = torch.cat((ensemble_coor_inpaint, aggregated.view(1, 1, 2)), dim=0)
-
-            # Nouveau seuillage après l’agrégation
-            threshold_mask = ((ensemble_coor_inpaint[:, :, 0] < COOR_TH) & (ensemble_coor_inpaint[:, :, 1] < COOR_TH))
-            ensemble_coor_inpaint[threshold_mask] = 0.
-
-            # Prédiction finale
-            tmp_pred = predict(ensemble_indices, c_pred=ensemble_coor_inpaint, img_scaler=img_scaler)
-            for key in tmp_pred:
-                inpaint_pred_dict[key].extend(tmp_pred[key])
-
-            # Mise à jour du buffer pour la prochaine itération
-            coor_inpaint_buffer = coor_inpaint_buffer[-buffer_size:]
-
-
-
-                
-
-            
 
     # Write csv file
     pred_dict = inpaint_pred_dict if inpaintnet is not None else tracknet_pred_dict

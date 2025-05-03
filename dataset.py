@@ -7,6 +7,8 @@ import pandas as pd
 from PIL import Image
 from tqdm import tqdm
 from torch.utils.data import Dataset, IterableDataset, get_worker_info
+from collections import deque
+
 from utils.general import get_rally_dirs, get_match_median, HEIGHT, WIDTH, SIGMA, IMG_FORMAT
 from line_profiler import LineProfiler 
 import numpy as np
@@ -282,70 +284,85 @@ class Shuttlecock_Trajectory_Dataset(Dataset):
 
 
 
-class VideoWindowDataset(Dataset):
+# dataset.py (ou dans predict.py si vous préférez)
+from collections import deque
+import cv2
+import numpy as np
+from torch.utils.data import IterableDataset
+
+class CircularVideoDataset(IterableDataset):
     def __init__(self,
                  video_file: str,
                  seq_len: int = 8,
                  sliding_step: int = 1,
                  bg_mode: str = '',
-                 HEIGHT: int = HEIGHT,
-                 WIDTH: int = WIDTH,
+                 HEIGHT: int = 360,
+                 WIDTH: int = 640,
                  max_sample_num: int = 1000,
                  video_range: tuple = None,
                  median: np.ndarray = None):
         self.video_file   = video_file
         self.seq_len      = seq_len
-        self.sliding_step = sliding_step
+        self.step         = sliding_step
         self.bg_mode      = bg_mode
         self.HEIGHT       = HEIGHT
         self.WIDTH        = WIDTH
 
-        # Ouvre la vidéo pour récupérer longueur et fps
+        # Ouvre la vidéo pour longueur & fps
         cap = cv2.VideoCapture(video_file)
-        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        fps          = int(cap.get(cv2.CAP_PROP_FPS))
+        self.video_len = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        self.fps       = int(cap.get(cv2.CAP_PROP_FPS))
         cap.release()
 
-        # Liste de tous les indices de début de séquences
-        self.starts = list(range(0, total_frames, sliding_step))
-        self.video_len = total_frames
-        self.fps       = fps
-
-        # Pré-génère la médiane si besoin
+        # Génération de la médiane si mode concat ou subtract
         if bg_mode and median is None:
             self.median = self._gen_median(max_sample_num, video_range)
         else:
             self.median = median
 
-    def __len__(self):
-        return len(self.starts)
+    def __iter__(self):
+        cap = cv2.VideoCapture(self.video_file)
+        buf = deque(maxlen=self.seq_len)
 
-    def __getitem__(self, idx):
-        start_f = self.starts[idx]
-        cap     = cv2.VideoCapture(self.video_file)
-        cap.set(cv2.CAP_PROP_POS_FRAMES, start_f)
-
-        frames = []
-        for i in range(self.seq_len):
+        # Pré-remplissage du buffer
+        for _ in range(self.seq_len):
             ret, frame = cap.read()
             if not ret:
-                # padding avec la dernière image si fin de vidéo
-                frames.append(frames[-1].copy())
-            else:
-                frames.append(frame)
+                break
+            buf.append(frame)
+        # Pad si vidéo trop courte
+        while len(buf) < self.seq_len:
+            buf.append(buf[-1].copy())
+
+        start_idx = 0
+        total = self.video_len
+
+        while True:
+            # 1) Prépare la fenêtre d’images
+            window = [cv2.cvtColor(f, cv2.COLOR_BGR2RGB) for f in buf]
+            # 2) Resize + format
+            imgs = np.stack([
+                cv2.resize(img, (self.WIDTH, self.HEIGHT),
+                           interpolation=cv2.INTER_LINEAR)
+                for img in window
+            ])
+            processed = self._process(imgs)
+
+            # 3) Indices pour post-traitement
+            idxs = np.clip(start_idx + np.arange(self.seq_len), 0, total-1)
+            data_idx = np.stack([idxs, idxs], axis=1).astype(np.int64)
+            yield data_idx, processed
+
+            # 4) Glissement du buffer
+            ret, next_frame = cap.read()
+            if not ret:
+                break
+            buf.append(next_frame)
+            start_idx += self.step
+
         cap.release()
 
-        # transformation RGB→(C,H,W), concat, bg_mode…
-        imgs = np.stack(frames)[..., ::-1]  # BGR→RGB
-        processed = self._process(imgs)
-
-        # On transmet aussi les indices de frame pour le post-traitement
-        data_idx = [(0, min(start_f + i, self.video_len-1)) for i in range(self.seq_len)]
-        data_idx = np.array(data_idx, dtype=np.int64)
-
-        return data_idx, processed
-
-    def _gen_median(self, max_sample_num, video_range):
+    def _gen_median(self, max_sample_num, video_range, downsample=4):
         print('Generate median image…')
         cap = cv2.VideoCapture(self.video_file)
         total = self.video_len
@@ -357,35 +374,41 @@ class VideoWindowDataset(Dataset):
         seg_len = end - start
         step    = max(1, seg_len // max_sample_num)
 
+        # Tailles réduites
+        small_w = max(1, self.WIDTH  // downsample)
+        small_h = max(1, self.HEIGHT // downsample)
+
         cap.set(cv2.CAP_PROP_POS_FRAMES, start)
         samples = []
         for _ in range(start, end, step):
             ret, f = cap.read()
             if not ret:
                 break
-            samples.append(f)
+            # downscale pour accélérer la médiane
+            f_small = cv2.resize(f, (small_w, small_h),
+                                interpolation=cv2.INTER_AREA)
+            samples.append(f_small)
             for __ in range(step-1):
                 cap.grab()
         cap.release()
 
-        median = np.median(np.stack(samples), axis=0)[..., ::-1]
-        if self.bg_mode == 'concat':
-            median = cv2.resize(median, (self.WIDTH, self.HEIGHT),
-                                interpolation=cv2.INTER_NEAREST)
-            median = median.transpose(2,0,1)
+        # médiane sur le petit volume (N, small_h, small_w, 3)
+        median_small = np.median(np.stack(samples), axis=0)[..., ::-1]  # BGR→RGB
+        # upscale en pleine résolution
+        median = cv2.resize(median_small, (self.WIDTH, self.HEIGHT),
+                            interpolation=cv2.INTER_NEAREST)
+        # transpose pour concat mode
+        median = median.transpose(2,0,1)  # (3, H, W)
         print('Median image generated.')
         return median
 
     def _process(self, imgs: np.ndarray):
-        ch_list = []
-        for i in range(self.seq_len):
-            resized = cv2.resize(imgs[i], (self.WIDTH, self.HEIGHT),
-                                 interpolation=cv2.INTER_LINEAR)
-            ch_list.append(resized.transpose(2,0,1))
-
-        stacked = np.concatenate(ch_list, axis=0)  # 24 canaux
+        # imgs = (seq_len, H, W, 3) RGB
+        ch_list = [imgs[i].transpose(2,0,1) for i in range(self.seq_len)]
+        stacked = np.concatenate(ch_list, axis=0)  # (3*seq_len, H, W)
 
         if self.bg_mode == 'subtract':
+            # Vous pouvez adapter la logique subtract ici...
             diff = cv2.absdiff(stacked[:3], self.median)
             gray = cv2.cvtColor(diff.transpose(1,2,0), cv2.COLOR_RGB2GRAY)[None]
             stacked = np.concatenate((gray, stacked[3:]), axis=0)

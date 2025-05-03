@@ -4,12 +4,15 @@ import numpy as np
 from tqdm import tqdm
 
 import torch
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, get_worker_info
 
 from test import predict_location, get_ensemble_weight, generate_inpaint_mask
-from dataset import Shuttlecock_Trajectory_Dataset, VideoWindowDataset
+from dataset import Shuttlecock_Trajectory_Dataset, CircularVideoDataset
 from utils.general import *
 import time
+from tqdm import tqdm
+
+
 
 
 def predict(indices, y_pred=None, c_pred=None, img_scaler=(1, 1)):
@@ -126,27 +129,24 @@ def main():
     tracknet.eval()
     seq_len = tracknet_seq_len
 
-    # Créer le dataset avec échantillonnage par recouvrement pour l'ensemble temporel
     if large_video:
-        dataset = VideoWindowDataset(
-            video_file,
+        dataset = CircularVideoDataset(
+            video_file=video_file,
             seq_len=seq_len,
             sliding_step=1,
             bg_mode=bg_mode,
-            max_sample_num=args.max_sample_num,
-            video_range=video_range
+            HEIGHT=HEIGHT,
+            WIDTH=WIDTH,
         )
         data_loader = DataLoader(
-                dataset,
-                batch_size=args.batch_size,        # plus gros batch
-                shuffle=False,
-                drop_last=False,
-                num_workers=8,                  # essayer plus de workers
-                pin_memory=True,
-                persistent_workers=True,
-                prefetch_factor=4                # plus de batches mis en file d’attente
-            )
-        video_len = dataset.video_len
+            dataset,
+            batch_size=args.batch_size,
+            shuffle=False,
+            num_workers=1,              # 1 worker suffit souvent pour un IterableDataset
+            pin_memory=True,
+            prefetch_factor=2
+        )
+        video_len = int(cv2.VideoCapture(video_file).get(cv2.CAP_PROP_FRAME_COUNT))
         print(f'Video length: {video_len}')
     else:
         # Échantillonnage de toutes les images de la vidéo

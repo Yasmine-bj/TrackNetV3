@@ -8,8 +8,7 @@ from PIL import Image
 from tqdm import tqdm
 from torch.utils.data import Dataset, IterableDataset, get_worker_info
 from collections import deque
-
-from utils.general import get_rally_dirs, get_match_median, HEIGHT, WIDTH, SIGMA, IMG_FORMAT
+from utils.general import HEIGHT, WIDTH, SIGMA, IMG_FORMAT
 from line_profiler import LineProfiler 
 import numpy as np
 import time
@@ -31,8 +30,8 @@ class CircularVideoDataset(IterableDataset):
                  seq_len: int = 8,
                  sliding_step: int = 1,
                  bg_mode: str = '',
-                 HEIGHT: int = 360,
-                 WIDTH: int = 640,
+                 HEIGHT: int = HEIGHT,
+                 WIDTH: int = WIDTH,
                  max_sample_num: int = 1000,
                  video_range: tuple = None,
                  median: np.ndarray = None):

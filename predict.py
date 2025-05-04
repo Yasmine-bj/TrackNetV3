@@ -2,42 +2,30 @@ import os
 import argparse
 import numpy as np
 from tqdm import tqdm
-
+import cv2
 import torch
 from torch.utils.data import DataLoader, get_worker_info
-
-from test import predict_location, get_ensemble_weight,predict
 from dataset import CircularVideoDataset
-from utils.general import *
+from utils.general import get_model, HEIGHT, WIDTH,write_pred_csv, write_pred_video,predict_location, get_ensemble_weight,predict
 import time
 from tqdm import tqdm
 
 
 
-
-
 def main():
-
 
     parser = argparse.ArgumentParser()
     parser.add_argument('--video_file', type=str, help='file path of the video')
     parser.add_argument('--tracknet_file', type=str, help='file path of the TrackNet model checkpoint')
-    parser.add_argument('--inpaintnet_file', type=str, default='', help='file path of the InpaintNet model checkpoint')
     parser.add_argument('--batch_size', type=int, default=16, help='batch size for inference')
-    parser.add_argument('--eval_mode', type=str, default='weight', choices=['nonoverlap', 'average', 'weight'], help='evaluation mode')
-    parser.add_argument('--max_sample_num', type=int, default=1500, help='maximum number of frames to sample for generating median image')
-    parser.add_argument('--video_range', type=lambda splits: [int(s) for s in splits.split(',')], default=None, help='range of start second and end second of the video for generating median image')
     parser.add_argument('--save_dir', type=str, default='pred_result', help='directory to save the prediction result')
-    parser.add_argument('--large_video', action='store_true', default=False, help='whether to process large video')
     parser.add_argument('--output_video', action='store_true', default=False, help='whether to output video with predicted trajectory')
     parser.add_argument('--traj_len', type=int, default=8, help='length of trajectory to draw on video')
     args = parser.parse_args()
 
-    num_workers = args.batch_size if args.batch_size <= 16 else 16
+
     video_file = args.video_file
     video_name = video_file.split('/')[-1][:-4]
-    video_range = args.video_range if args.video_range else None
-    large_video = args.large_video
     out_csv_file = os.path.join(args.save_dir, f'{video_name}_ball.csv')
     out_video_file = os.path.join(args.save_dir, f'{video_name}.mp4')
 
@@ -46,20 +34,12 @@ def main():
     
     # Load model
     tracknet_ckpt = torch.load(args.tracknet_file)
-    tracknet_seq_len = tracknet_ckpt['param_dict']['seq_len']
+    seq_len = tracknet_ckpt['param_dict']['seq_len']
     bg_mode = tracknet_ckpt['param_dict']['bg_mode']
-    tracknet = get_model('TrackNet', tracknet_seq_len, bg_mode).cuda()
+    tracknet = get_model('TrackNet', seq_len, bg_mode).cuda()
     tracknet.load_state_dict(tracknet_ckpt['model'])
-    #print(tracknet_ckpt['param_dict'])
+    print(tracknet_ckpt['param_dict'])
 
-
-    if args.inpaintnet_file:
-        inpaintnet_ckpt = torch.load(args.inpaintnet_file)
-        inpaintnet_seq_len = inpaintnet_ckpt['param_dict']['seq_len']
-        inpaintnet = get_model('InpaintNet').cuda()
-        inpaintnet.load_state_dict(inpaintnet_ckpt['model'])
-    else:
-        inpaintnet = None
 
     cap = cv2.VideoCapture(args.video_file)
     w, h = (int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)))
@@ -71,10 +51,9 @@ def main():
 
     # Test on TrackNet
     tracknet.eval()
-    seq_len = tracknet_seq_len
 
-    if large_video:
-        dataset = CircularVideoDataset(
+      
+    dataset = CircularVideoDataset(
             video_file=video_file,
             seq_len=seq_len,
             sliding_step=1,
@@ -82,7 +61,7 @@ def main():
             HEIGHT=HEIGHT,
             WIDTH=WIDTH,
         )
-        data_loader = DataLoader(
+    data_loader = DataLoader(
             dataset,
             batch_size=args.batch_size,
             shuffle=False,
@@ -90,8 +69,11 @@ def main():
             pin_memory=True,
             prefetch_factor=2
         )
-        video_len = int(cv2.VideoCapture(video_file).get(cv2.CAP_PROP_FRAME_COUNT))
-        print(f'Video length: {video_len}')
+
+    video_len = int(cv2.VideoCapture(video_file).get(cv2.CAP_PROP_FRAME_COUNT))
+    print(f'Video length: {video_len}')
+
+
     
 
     # Initialisation des paramètres du buffer de prédiction
@@ -101,7 +83,7 @@ def main():
     batch_i = torch.arange(seq_len)              # [0, 1, 2, ..., seq_len-1]
     frame_i = torch.arange(seq_len - 1, -1, -1)   # [seq_len-1, ..., 0]
     y_pred_buffer = torch.zeros((buffer_size, seq_len, HEIGHT, WIDTH), dtype=torch.float32)
-    weight = get_ensemble_weight(seq_len, args.eval_mode)
+    weight = get_ensemble_weight(seq_len, 'weight')
 
     for step, (i, x) in enumerate(tqdm(data_loader)):
         x = x.float().cuda()
@@ -146,12 +128,11 @@ def main():
     
 
     # Write csv file
-    pred_dict = inpaint_pred_dict if inpaintnet is not None else tracknet_pred_dict
-    write_pred_csv(pred_dict, save_file=out_csv_file)
+    write_pred_csv(tracknet_pred_dict, save_file=out_csv_file)
 
     # Write video with predicted coordinates
     if args.output_video:
-        write_pred_video(video_file, pred_dict, save_file=out_video_file, traj_len=args.traj_len)
+         write_pred_video(video_file, tracknet_pred_dict, save_file=out_video_file, traj_len=args.traj_len)
 
     print('Done.')
 
